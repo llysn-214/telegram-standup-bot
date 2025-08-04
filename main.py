@@ -4,9 +4,23 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import os
 
-# Set your bot token here
-BOT_TOKEN = '8359217195:AAH4L9n0_RKgeRXEJGUzTK1oU6S8qgs_Cvw'
+from flask import Flask
+import threading
+
+# --- FLASK SERVER FOR RENDER PINGING ---
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "OK", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# --- BOT TOKEN (from environment variable for security) ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # --- DB SETUP ---
 conn = sqlite3.connect('schedules.db', check_same_thread=False)
@@ -31,12 +45,16 @@ scheduler.start()
 # --- CORE FUNCTIONALITY ---
 
 def post_scheduled_message(chat_id, message, schedule_id):
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    logger.info(f"Posting scheduled message: {message} to chat {chat_id}")
-    app.bot.send_message(chat_id=chat_id, text=message)
-    # Remove from DB
-    cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
-    conn.commit()
+    try:
+        # Needs new Application instance due to threading
+        app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+        logger.info(f"Posting scheduled message: {message} to chat {chat_id}")
+        app_.bot.send_message(chat_id=chat_id, text=message)
+        # Remove from DB
+        cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error posting scheduled message: {e}")
 
 async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -90,11 +108,13 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("schedule", schedule))
-    app.add_handler(CommandHandler("myschedules", myschedules))
-    print("Bot running...")
-    app.run_polling()
+    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_.add_handler(CommandHandler("schedule", schedule))
+    app_.add_handler(CommandHandler("myschedules", myschedules))
+    logger.info("Bot running...")
+    app_.run_polling()
 
 if __name__ == "__main__":
+    # Start Flask server in a separate thread for UptimeRobot
+    threading.Thread(target=run_flask).start()
     main()
