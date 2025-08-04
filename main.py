@@ -96,11 +96,25 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group_id = int(query.data.split("_")[1])
     context.user_data['target_chat_id'] = group_id
-    keyboard = [
-        [InlineKeyboardButton("No topic (main chat)", callback_data="topic_none")],
-        [InlineKeyboardButton("Enter topic ID manually", callback_data="topic_manual")]
-    ]
-    await query.edit_message_text("Select topic (or skip):", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # --- Fetch topics in the group (forum supergroups only) ---
+    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    try:
+        # Only works in forum-enabled groups!
+        forum_topics = await app_.bot.get_forum_topic_list(group_id)
+        keyboard = [
+            [InlineKeyboardButton(topic["name"], callback_data=f"topic_{topic['message_thread_id']}")]
+            for topic in forum_topics["topics"]
+        ]
+        keyboard.insert(0, [InlineKeyboardButton("Main chat (no topic)", callback_data="topic_none")])
+        await query.edit_message_text("Choose a topic:", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        # If not a forum group, just allow main chat
+        logger.info(f"No topics or not a forum group: {e}")
+        keyboard = [
+            [InlineKeyboardButton("Main chat (no topic)", callback_data="topic_none")]
+        ]
+        await query.edit_message_text("No topics found or not a forum group. Using main chat.", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_TOPIC
 
 async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,21 +122,8 @@ async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "topic_none":
         context.user_data['topic_id'] = None
-        return await ask_time(update, context)
     else:
-        await query.edit_message_text(
-            "Please reply with the **topic/thread ID** (send as a number).\n\nTo cancel, type /cancel.",
-            parse_mode='Markdown'
-        )
-        return CHOOSE_TOPIC
-
-async def set_topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    topic_id = update.message.text.strip()
-    if not topic_id.isdigit():
-        await update.message.reply_text("Invalid topic ID. Please send a number, or type /cancel.")
-        return CHOOSE_TOPIC
-    context.user_data['topic_id'] = int(topic_id)
-    await update.message.reply_text("Topic set! Now let's pick a time.")
+        context.user_data['topic_id'] = int(query.data.split("_")[1])
     return await ask_time(update, context)
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,119 +147,4 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    data = query.data.replace("time_", "")
-    if data == "manual":
-        await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour clock).\n\nType /cancel to abort.", parse_mode='Markdown')
-        return CHOOSE_TIME
-    else:
-        context.user_data['run_at'] = data
-        await query.edit_message_text(f"Time set to: {data}\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.")
-        return WRITE_MSG
-
-async def set_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    try:
-        _ = datetime.strptime(txt, "%Y-%m-%d %H:%M")
-        context.user_data['run_at'] = txt
-        await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
-        return WRITE_MSG
-    except Exception:
-        await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr), or type /cancel.")
-        return CHOOSE_TIME
-
-async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['message'] = update.message.text
-    group = context.user_data.get('target_chat_id')
-    topic = context.user_data.get('topic_id')
-    run_at = context.user_data.get('run_at')
-    msg = f"Ready to schedule:\nGroup: `{group}`\n"
-    if topic:
-        msg += f"Topic ID: `{topic}`\n"
-    msg += f"Time: `{run_at}`\nMessage:\n\n{context.user_data['message']}\n\nConfirm?"
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]
-    ]
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    return CONFIRM
-
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "confirm_yes":
-        group = context.user_data['target_chat_id']
-        topic = context.user_data.get('topic_id')
-        run_at = context.user_data['run_at']
-        message = context.user_data['message']
-        user_id = query.from_user.id
-        run_at_dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M")
-
-        cur.execute(
-            "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at) VALUES (?, ?, ?, ?, ?)",
-            (group, topic, user_id, message, run_at_dt.isoformat())
-        )
-        conn.commit()
-        schedule_id = cur.lastrowid
-
-        scheduler.add_job(
-            post_scheduled_message,
-            'date',
-            run_date=run_at_dt,
-            args=[group, topic, message, schedule_id],
-            id=str(schedule_id)
-        )
-        await query.edit_message_text("✅ Scheduled!")
-    else:
-        await query.edit_message_text("Cancelled.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Scheduling cancelled.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ['group', 'supergroup']:
-        register_group(update.effective_chat)
-
-async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
-    msg = f"Chat ID: `{chat_id}`"
-    if msg_thread_id:
-        msg += f"\nTopic (Thread) ID: `{msg_thread_id}`"
-    else:
-        msg += "\n(Not in a topic/thread right now.)"
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-def run_telegram_bot():
-    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
-        states={
-            CHOOSE_GROUP: [CallbackQueryHandler(choose_group, pattern="^group_")],
-            CHOOSE_TOPIC: [
-                CallbackQueryHandler(choose_topic, pattern="^topic_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_topic_id)
-            ],
-            CHOOSE_TIME: [
-                CallbackQueryHandler(choose_time, pattern="^time_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_manual_time)
-            ],
-            WRITE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, write_msg)],
-            CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True
-    )
-    app_.add_handler(conv_handler)
-    app_.add_handler(CommandHandler("whereami", whereami))
-    app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
-    logger.info("Bot running...")
-    app_.run_polling()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
-    run_telegram_bot()
+    await query.
