@@ -82,9 +82,9 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id):
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
         try:
             if topic_id:
-                await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='MarkdownV2', disable_web_page_preview=False)
+                await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
             else:
-                await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='MarkdownV2', disable_web_page_preview=False)
+                await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML', disable_web_page_preview=False)
             cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
             conn.commit()
             logger.info(f"Message sent and schedule {schedule_id} deleted.")
