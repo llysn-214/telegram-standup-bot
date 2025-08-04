@@ -154,6 +154,17 @@ async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "\nUse the chat_id or group name in /schedule. For topics, use topic_id as 2nd argument if needed."
     await update.message.reply_text(msg)
 
+# --- /WHEREAMI COMMAND ---
+async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
+    msg = f"Chat ID: `{chat_id}`"
+    if msg_thread_id:
+        msg += f"\nTopic (Thread) ID: `{msg_thread_id}`"
+    else:
+        msg += "\n(Not in a topic/thread right now.)"
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
 # --- REGISTER GROUPS WHEN BOT SEES MESSAGES IN GROUPS ---
 async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type in ['group', 'supergroup']:
@@ -164,10 +175,10 @@ def main():
     app_.add_handler(CommandHandler("schedule", schedule))
     app_.add_handler(CommandHandler("myschedules", myschedules))
     app_.add_handler(CommandHandler("groups", groups))
+    app_.add_handler(CommandHandler("whereami", whereami))
     app_.add_handler(CommandHandler("start", register_chat_on_message))
     app_.add_handler(CommandHandler("help", register_chat_on_message))
     app_.add_handler(CommandHandler("register", register_chat_on_message))
-    # Listen to every message to register group (optional, could use a MessageHandler if desired)
     app_.add_handler(CommandHandler("test", register_chat_on_message))
     logger.info("Bot running...")
     app_.run_polling()
