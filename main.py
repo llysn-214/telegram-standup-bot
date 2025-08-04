@@ -8,8 +8,11 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, filters, ConversationHandler
 )
+from flask import Flask
+import threading
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+PORT = int(os.environ.get('PORT', 10000))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +36,16 @@ conn.commit()
 
 scheduler = BackgroundScheduler()
 scheduler.start()
+
+# --- Flask HTTP server for Render/UptimeRobot ---
+app_flask = Flask(__name__)
+
+@app_flask.route("/")
+def home():
+    return "OK", 200
+
+def run_flask():
+    app_flask.run(host="0.0.0.0", port=PORT)
 
 # --- Conversation states ---
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(5)
@@ -83,7 +96,6 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group_id = int(query.data.split("_")[1])
     context.user_data['target_chat_id'] = group_id
-    # Let user pick topic (or skip)
     keyboard = [
         [InlineKeyboardButton("No topic (main chat)", callback_data="topic_none")],
         [InlineKeyboardButton("Enter topic ID manually", callback_data="topic_manual")]
@@ -98,15 +110,19 @@ async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['topic_id'] = None
         return await ask_time(update, context)
     else:
-        await query.edit_message_text("Please reply with the **topic/thread ID** (send as a number).")
+        await query.edit_message_text(
+            "Please reply with the **topic/thread ID** (send as a number).\n\nTo cancel, type /cancel.",
+            parse_mode='Markdown'
+        )
         return CHOOSE_TOPIC
 
 async def set_topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic_id = update.message.text.strip()
     if not topic_id.isdigit():
-        await update.message.reply_text("Invalid topic ID. Please send a number.")
+        await update.message.reply_text("Invalid topic ID. Please send a number, or type /cancel.")
         return CHOOSE_TOPIC
     context.user_data['topic_id'] = int(topic_id)
+    await update.message.reply_text("Topic set! Now let's pick a time.")
     return await ask_time(update, context)
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +149,7 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data.replace("time_", "")
     if data == "manual":
-        await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour clock).", parse_mode='Markdown')
+        await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour clock).\n\nType /cancel to abort.", parse_mode='Markdown')
         return CHOOSE_TIME
     else:
         context.user_data['run_at'] = data
@@ -148,7 +164,7 @@ async def set_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
         return WRITE_MSG
     except Exception:
-        await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr).")
+        await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr), or type /cancel.")
         return CHOOSE_TIME
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,12 +214,15 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- Group registration (as before) ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Scheduling cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
 async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type in ['group', 'supergroup']:
         register_group(update.effective_chat)
 
-# --- /whereami as before ---
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
@@ -214,9 +233,8 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\n(Not in a topic/thread right now.)"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-def main():
+def run_telegram_bot():
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-    # --- Button-driven scheduler flow ---
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
         states={
@@ -232,7 +250,7 @@ def main():
             WRITE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, write_msg)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")]
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler('cancel', cancel)],
         allow_reentry=True
     )
     app_.add_handler(conv_handler)
@@ -242,4 +260,5 @@ def main():
     app_.run_polling()
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_flask).start()
+    run_telegram_bot()
