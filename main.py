@@ -67,22 +67,29 @@ def home():
 def run_flask():
     app_flask.run(host="0.0.0.0", port=PORT)
 
+# --- GLOBAL MAIN ASYNCIO EVENT LOOP ---
+main_asyncio_loop = None
+
 # --- Async Flood Control Queue ---
 send_queue = asyncio.Queue()
 
 # Thread-safe enqueue helper for jobs from any thread
 def safe_enqueue_send_job(send_job):
+    global main_asyncio_loop
     try:
         loop = asyncio.get_running_loop()
+        if loop and loop.is_running():
+            asyncio.create_task(send_queue.put(send_job))
+        else:
+            if main_asyncio_loop and main_asyncio_loop.is_running():
+                asyncio.run_coroutine_threadsafe(send_queue.put(send_job), main_asyncio_loop)
+            else:
+                raise RuntimeError("No running asyncio event loop available to enqueue jobs.")
     except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        # We're in the main thread/event loop
-        asyncio.create_task(send_queue.put(send_job))
-    else:
-        # We're in another thread (like APScheduler)
-        main_loop = asyncio.get_event_loop_policy().get_event_loop()
-        asyncio.run_coroutine_threadsafe(send_queue.put(send_job), main_loop)
+        if main_asyncio_loop and main_asyncio_loop.is_running():
+            asyncio.run_coroutine_threadsafe(send_queue.put(send_job), main_asyncio_loop)
+        else:
+            raise RuntimeError("No running asyncio event loop available to enqueue jobs.")
 
 async def flood_control_worker():
     while True:
@@ -472,7 +479,9 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 def run_telegram_bot():
+    global main_asyncio_loop
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    main_asyncio_loop = asyncio.get_event_loop()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
         states={
@@ -496,8 +505,7 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("topicname", set_topic_name))
     app_.add_handler(CallbackQueryHandler(cancel_schedule, pattern="^cancel_"))
     app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
-    loop = asyncio.get_event_loop()
-    loop.create_task(flood_control_worker())
+    main_asyncio_loop.create_task(flood_control_worker())
     logger.info("Bot running...")
     app_.run_polling()
 
