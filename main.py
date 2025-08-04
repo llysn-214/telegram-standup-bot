@@ -12,7 +12,6 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler
 )
 from flask import Flask
-from collections import defaultdict
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 10000))
@@ -34,7 +33,6 @@ cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     recurrence TEXT DEFAULT 'none',
     recurrence_data TEXT
 )''')
-# Migration if needed:
 try:
     cur.execute("ALTER TABLE schedules ADD COLUMN recurrence TEXT DEFAULT 'none'")
 except sqlite3.OperationalError:
@@ -72,6 +70,20 @@ def run_flask():
 # --- Async Flood Control Queue ---
 send_queue = asyncio.Queue()
 
+# Thread-safe enqueue helper for jobs from any thread
+def safe_enqueue_send_job(send_job):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # We're in the main thread/event loop
+        asyncio.create_task(send_queue.put(send_job))
+    else:
+        # We're in another thread (like APScheduler)
+        main_loop = asyncio.get_event_loop_policy().get_event_loop()
+        asyncio.run_coroutine_threadsafe(send_queue.put(send_job), main_loop)
+
 async def flood_control_worker():
     while True:
         send_job = await send_queue.get()
@@ -79,13 +91,13 @@ async def flood_control_worker():
             await send_job()
         except Exception as e:
             logger.error(f"Flood control worker error: {e}")
-        await asyncio.sleep(3)  # 3 seconds between each message (rate limit)
+        await asyncio.sleep(3)
         send_queue.task_done()
 
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
     async def send_job():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-        for attempt in range(1, 4):  # Up to 3 tries
+        for attempt in range(1, 4):
             try:
                 if topic_id:
                     await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
@@ -102,12 +114,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                     await asyncio.sleep(3)
         logger.error(f"All retries failed for schedule {schedule_id}.")
 
-    try:
-        asyncio.get_event_loop().call_soon_threadsafe(send_queue.put_nowait, send_job)
-    except RuntimeError:
-        # For edge cases if called from a different thread (like APScheduler), use loop directly
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(send_queue.put_nowait, send_job)
+    safe_enqueue_send_job(send_job)
 
 # --- Conversation states ---
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_DAY, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(7)
@@ -437,7 +444,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- Self-learning: Register topics on ANY message seen in a group or topic
 async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type in ['group', 'supergroup']:
         register_group(update.effective_chat)
