@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DB setup (same as before)
+# DB setup
 conn = sqlite3.connect('schedules.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
@@ -36,8 +36,6 @@ scheduler.start()
 
 # --- Conversation states ---
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(5)
-
-user_data_dict = {}
 
 def register_group(chat):
     try:
@@ -85,9 +83,7 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group_id = int(query.data.split("_")[1])
     context.user_data['target_chat_id'] = group_id
-    # Fetch topics (for prototype, let user skip)
-    # If you want to list real topics, you'd need to fetch those from Telegram's API (requires extra logic)
-    # For now, offer "No Topic" as default, and let user enter topic ID if needed
+    # Let user pick topic (or skip)
     keyboard = [
         [InlineKeyboardButton("No topic (main chat)", callback_data="topic_none")],
         [InlineKeyboardButton("Enter topic ID manually", callback_data="topic_manual")]
@@ -114,7 +110,6 @@ async def set_topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_time(update, context)
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Choose preset times or manual
     now = datetime.now()
     presets = [
         ("In 5 min", now + timedelta(minutes=5)),
@@ -241,11 +236,8 @@ def main():
         allow_reentry=True
     )
     app_.add_handler(conv_handler)
-    # --- Support for /whereami ---
     app_.add_handler(CommandHandler("whereami", whereami))
-    # --- Register groups when seeing any message in a group ---
-    from telegram.ext import MessageHandler, filters as tgfilters
-    app_.add_handler(MessageHandler(tgfilters.ALL, register_chat_on_message))
+    app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
     logger.info("Bot running...")
     app_.run_polling()
 
