@@ -1,7 +1,7 @@
 import logging
 import sqlite3
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 import pytz
 import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,7 +20,7 @@ PH_TZ = pytz.timezone('Asia/Manila')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DB setup (now includes topics table)
+# --- DB setup (add recurrence columns if missing) ---
 conn = sqlite3.connect('schedules.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
@@ -29,8 +29,20 @@ cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     topic_id INTEGER,
     user_id INTEGER,
     message TEXT,
-    run_at TEXT
+    run_at TEXT,
+    recurrence TEXT DEFAULT 'none',
+    recurrence_data TEXT
 )''')
+# If your table existed from before, ensure columns exist:
+try:
+    cur.execute("ALTER TABLE schedules ADD COLUMN recurrence TEXT DEFAULT 'none'")
+except sqlite3.OperationalError:
+    pass
+try:
+    cur.execute("ALTER TABLE schedules ADD COLUMN recurrence_data TEXT")
+except sqlite3.OperationalError:
+    pass
+
 cur.execute('''CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
     title TEXT
@@ -57,7 +69,7 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=PORT)
 
 # --- Conversation states ---
-CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(5)
+CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_DAY, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(7)
 
 def register_group(chat):
     try:
@@ -76,8 +88,7 @@ def register_topic(chat_id, topic_id, topic_name):
     except Exception as e:
         logger.error(f"Failed to register topic: {e}")
 
-def post_scheduled_message(target_chat_id, topic_id, message, schedule_id):
-    logger.info(f"Trying to send: chat_id={target_chat_id}, topic_id={topic_id}, message='{message}', schedule_id={schedule_id}")
+def send_scheduled_message(target_chat_id, topic_id, message):
     async def send():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
         try:
@@ -85,13 +96,18 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id):
                 await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
             else:
                 await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML', disable_web_page_preview=False)
-            cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
-            conn.commit()
-            logger.info(f"Message sent and schedule {schedule_id} deleted.")
         except Exception as e:
             logger.exception(f"Error posting scheduled message: {e}")
-
     asyncio.run(send())
+
+def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
+    logger.info(f"Trying to send: chat_id={target_chat_id}, topic_id={topic_id}, message='{message}', schedule_id={schedule_id}")
+    send_scheduled_message(target_chat_id, topic_id, message)
+    # For one-time, delete after send. For recurring, do not delete.
+    if recurrence == "none":
+        cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+        conn.commit()
+        logger.info(f"Message sent and schedule {schedule_id} deleted.")
 
 # --- Button-driven scheduling ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,6 +119,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Available Commands:*\n\n"
         "/start – Begin scheduling a message with guided buttons\n"
         "/help – Show this help message\n"
+        "/myschedules – List and cancel your future scheduled messages\n"
         "/whereami – Show the group and topic/thread ID (useful for admins and troubleshooting)\n"
         "/cancel – Cancel the current operation (only when in scheduling flow)\n"
         "/topicname [Display Name] – Set a human-friendly name for the current topic (use in topic)\n\n"
@@ -113,7 +130,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*How to schedule:*\n"
         "1. DM or /start the bot\n"
         "2. Tap 'Schedule Message' and follow the button prompts\n"
-        "3. Select group, topic, time (Asia/Manila), and type your message\n"
+        "3. Select group, topic, recurrence, time (Asia/Manila), and type your message\n"
         "4. Confirm to schedule\n"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -132,6 +149,63 @@ async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     register_topic(update.effective_chat.id, topic_id, name)
     await update.message.reply_text(f"Topic name for ID {topic_id} set to: {name}")
+
+# --- /myschedules and Cancel button
+async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cur.execute(
+        "SELECT id, target_chat_id, topic_id, message, run_at, recurrence, recurrence_data FROM schedules WHERE user_id = ? ORDER BY run_at ASC",
+        (user_id,)
+    )
+    schedules = cur.fetchall()
+    if not schedules:
+        await update.message.reply_text("You have no scheduled messages.")
+        return
+
+    for sched in schedules:
+        schedule_id, chat_id, topic_id, msg, run_at, recurrence, recurrence_data = sched
+        # Get group name
+        cur.execute("SELECT title FROM groups WHERE chat_id = ?", (chat_id,))
+        group_row = cur.fetchone()
+        group_name = group_row[0] if group_row else str(chat_id)
+        # Get topic name
+        tname = None
+        if topic_id:
+            cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (chat_id, topic_id))
+            trow = cur.fetchone()
+            tname = trow[0] if trow else f"Topic {topic_id}"
+        # Display time in PH
+        dt = datetime.fromisoformat(run_at)
+        dt_ph = dt.astimezone(PH_TZ)
+        preview = msg[:60].replace('\n', ' ') + ("..." if len(msg) > 60 else "")
+        text = f"<b>Group:</b> {group_name}\n"
+        text += f"<b>Topic:</b> {tname if tname else 'Main chat'}\n"
+        if recurrence == "weekly":
+            weekday, at_time = recurrence_data.split(":")
+            text += f"<b>Repeats:</b> Every {weekday} {at_time} Asia/Manila\n"
+        else:
+            text += f"<b>When:</b> {dt_ph.strftime('%Y-%m-%d %H:%M')} Asia/Manila\n"
+        text += f"<b>Message:</b> <code>{preview}</code>"
+
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{schedule_id}")]]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if not data.startswith("cancel_"):
+        return
+    schedule_id = int(data.split("_")[1])
+    # Remove job from APScheduler
+    try:
+        scheduler.remove_job(str(schedule_id))
+    except Exception:
+        pass  # Job may have already executed/been removed
+    # Remove from DB
+    cur.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+    conn.commit()
+    await query.edit_message_text("❌ Scheduled message cancelled.")
 
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -180,9 +254,37 @@ async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     topic_id = int(query.data.split("_")[1])
     context.user_data['topic_id'] = topic_id if topic_id != 0 else None
-    return await ask_time(update, context)
+
+    # Choose recurrence type
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    keyboard = [
+        [InlineKeyboardButton("One time only", callback_data="recurr_none")]
+    ] + [
+        [InlineKeyboardButton(f"Repeat every {day}", callback_data=f"recurr_weekly_{day}")]
+        for day in weekdays
+    ]
+    await query.edit_message_text(
+        "Do you want this message to repeat?\n\nSelect a day to repeat weekly or pick 'One time only'.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSE_RECURRENCE
+
+async def choose_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "recurr_none":
+        context.user_data['recurrence'] = "none"
+        return await ask_time(update, context)
+    elif data.startswith("recurr_weekly_"):
+        day = data.split("_")[-1]
+        context.user_data['recurrence'] = "weekly"
+        context.user_data['weekday'] = day
+        await query.edit_message_text(f"Enter the time (24h, Asia/Manila) for every {day}, e.g. 13:00 for 1PM.")
+        return CHOOSE_TIME
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This is for one-time schedule
     now = datetime.now(PH_TZ)
     presets = [
         ("In 5 min", now + timedelta(minutes=5)),
@@ -202,34 +304,47 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_TIME
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data.replace("time_", "")
-    if data == "manual":
-        await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour, Asia/Manila).\n\nType /cancel to abort.", parse_mode='Markdown')
-        return CHOOSE_TIME
+    query = getattr(update, "callback_query", None)
+    if query:
+        await query.answer()
+        data = query.data.replace("time_", "")
+        if data == "manual":
+            await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour, Asia/Manila).\n\nType /cancel to abort.", parse_mode='Markdown')
+            return CHOOSE_TIME
+        else:
+            context.user_data['run_at'] = data
+            await query.edit_message_text(f"Time set to: {data} (Asia/Manila)\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.")
+            return WRITE_MSG
     else:
-        context.user_data['run_at'] = data
-        await query.edit_message_text(f"Time set to: {data} (Asia/Manila)\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.")
-        return WRITE_MSG
-
-async def set_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    try:
-        dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
-        dt = PH_TZ.localize(dt)
-        context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
-        await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
-        return WRITE_MSG
-    except Exception:
-        await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr), or type /cancel.")
-        return CHOOSE_TIME
+        # For recurring, this is just HH:MM in Asia/Manila
+        txt = update.message.text.strip()
+        if context.user_data.get('recurrence', "none") == "weekly":
+            # Validate HH:MM
+            try:
+                dt_time.fromisoformat(txt)
+                context.user_data['recurr_time'] = txt
+                await update.message.reply_text(f"Time set to {txt}. Now, please send your message text.")
+                return WRITE_MSG
+            except Exception:
+                await update.message.reply_text("Invalid format. Use HH:MM (e.g. 13:00 for 1PM).")
+                return CHOOSE_TIME
+        else:
+            # For one-time manual entry
+            try:
+                dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
+                dt = PH_TZ.localize(dt)
+                context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
+                await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
+                return WRITE_MSG
+            except Exception:
+                await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr), or type /cancel.")
+                return CHOOSE_TIME
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['message'] = update.message.text
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
-    run_at = context.user_data.get('run_at')
+    recurrence = context.user_data.get('recurrence', "none")
     msg = f"Ready to schedule:\nGroup: `{group}`\n"
     if topic:
         cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (group, topic))
@@ -238,7 +353,15 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"Topic: `{tname[0]}`\n"
         else:
             msg += f"Topic ID: `{topic}`\n"
-    msg += f"Time: `{run_at}` (Asia/Manila)\nMessage:\n\n{context.user_data['message']}\n\nConfirm?"
+
+    if recurrence == "weekly":
+        weekday = context.user_data['weekday']
+        at_time = context.user_data['recurr_time']
+        msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)\n"
+    else:
+        run_at = context.user_data.get('run_at')
+        msg += f"Time: `{run_at}` (Asia/Manila)\n"
+    msg += f"Message:\n\n{context.user_data['message']}\n\nConfirm?"
     keyboard = [
         [InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]
@@ -252,28 +375,60 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "confirm_yes":
         group = context.user_data['target_chat_id']
         topic = context.user_data.get('topic_id')
-        run_at = context.user_data['run_at']
         message = context.user_data['message']
         user_id = query.from_user.id
-        # Convert PH time to UTC for APScheduler (if needed)
-        dt_ph = PH_TZ.localize(datetime.strptime(run_at, "%Y-%m-%d %H:%M"))
-        dt_utc = dt_ph.astimezone(pytz.utc)
+        recurrence = context.user_data.get('recurrence', "none")
 
-        cur.execute(
-            "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at) VALUES (?, ?, ?, ?, ?)",
-            (group, topic, user_id, message, dt_utc.isoformat())
-        )
-        conn.commit()
-        schedule_id = cur.lastrowid
-
-        scheduler.add_job(
-            post_scheduled_message,
-            'date',
-            run_date=dt_utc,
-            args=[group, topic, message, schedule_id],
-            id=str(schedule_id)
-        )
-        await query.edit_message_text("✅ Scheduled!")
+        if recurrence == "weekly":
+            weekday = context.user_data['weekday']
+            at_time = context.user_data['recurr_time']
+            # For DB, store next run as run_at, recurrence="weekly", recurrence_data="Monday:13:00"
+            # Schedule using APScheduler's cron (day_of_week=weekday, hour, minute)
+            dt_now = datetime.now(PH_TZ)
+            week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+            day_idx = week_days.index(weekday)
+            # Find next occurrence
+            next_dt = dt_now
+            while next_dt.weekday() != day_idx or next_dt.time() > dt_time.fromisoformat(at_time):
+                next_dt += timedelta(days=1)
+            next_dt = next_dt.replace(hour=int(at_time.split(":")[0]), minute=int(at_time.split(":")[1]), second=0, microsecond=0)
+            dt_utc = PH_TZ.localize(next_dt).astimezone(pytz.utc)
+            # Store in DB
+            cur.execute(
+                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (group, topic, user_id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{at_time}")
+            )
+            conn.commit()
+            schedule_id = cur.lastrowid
+            # Add APScheduler cron job
+            scheduler.add_job(
+                post_scheduled_message,
+                'cron',
+                day_of_week=weekday.lower(),
+                hour=int(at_time.split(":")[0]),
+                minute=int(at_time.split(":")[1]),
+                args=[group, topic, message, schedule_id, "weekly"],
+                id=str(schedule_id)
+            )
+            await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!")
+        else:
+            run_at = context.user_data['run_at']
+            dt_ph = PH_TZ.localize(datetime.strptime(run_at, "%Y-%m-%d %H:%M"))
+            dt_utc = dt_ph.astimezone(pytz.utc)
+            cur.execute(
+                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence) VALUES (?, ?, ?, ?, ?, ?)",
+                (group, topic, user_id, message, dt_utc.isoformat(), "none")
+            )
+            conn.commit()
+            schedule_id = cur.lastrowid
+            scheduler.add_job(
+                post_scheduled_message,
+                'date',
+                run_date=dt_utc,
+                args=[group, topic, message, schedule_id, "none"],
+                id=str(schedule_id)
+            )
+            await query.edit_message_text("✅ One-time scheduled message set!")
     else:
         await query.edit_message_text("Cancelled.")
     context.user_data.clear()
@@ -291,7 +446,6 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
         topic_id = getattr(update.message, "message_thread_id", None)
         topic_name = None
         if topic_id:
-            # Try to use the topic name if available (via /topicname or learned earlier)
             cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (update.effective_chat.id, topic_id))
             row = cur.fetchone()
             if row:
@@ -320,9 +474,10 @@ def run_telegram_bot():
         states={
             CHOOSE_GROUP: [CallbackQueryHandler(choose_group, pattern="^group_")],
             CHOOSE_TOPIC: [CallbackQueryHandler(choose_topic, pattern="^topic_")],
+            CHOOSE_RECURRENCE: [CallbackQueryHandler(choose_recurrence, pattern="^recurr_")],
             CHOOSE_TIME: [
                 CallbackQueryHandler(choose_time, pattern="^time_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_manual_time)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, choose_time)
             ],
             WRITE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, write_msg)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")]
@@ -332,8 +487,10 @@ def run_telegram_bot():
     )
     app_.add_handler(conv_handler)
     app_.add_handler(CommandHandler("help", help_command))
+    app_.add_handler(CommandHandler("myschedules", myschedules))
     app_.add_handler(CommandHandler("whereami", whereami))
     app_.add_handler(CommandHandler("topicname", set_topic_name))
+    app_.add_handler(CallbackQueryHandler(cancel_schedule, pattern="^cancel_"))
     app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
     logger.info("Bot running...")
     app_.run_polling()
