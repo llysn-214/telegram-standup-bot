@@ -1,14 +1,20 @@
 import logging
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Update, Chat, Message
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
+    MessageHandler, filters, ConversationHandler
+)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# --- DB SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# DB setup (same as before)
 conn = sqlite3.connect('schedules.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
@@ -25,136 +31,184 @@ cur.execute('''CREATE TABLE IF NOT EXISTS groups (
 )''')
 conn.commit()
 
-# --- LOGGING ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- SCHEDULER SETUP ---
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# --- HELPER: Group Registry ---
-def register_group(chat: Chat):
+# --- Conversation states ---
+CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(5)
+
+user_data_dict = {}
+
+def register_group(chat):
     try:
         cur.execute("INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)", (chat.id, chat.title or "Unnamed"))
         conn.commit()
     except Exception as e:
         logger.error(f"Failed to register group: {e}")
 
-# --- SCHEDULING FUNCTION ---
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id):
     try:
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
         logger.info(f"Posting scheduled message: {message} to chat {target_chat_id}, topic {topic_id}")
         if topic_id:
-            app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id))
+            app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='MarkdownV2', disable_web_page_preview=False)
         else:
-            app_.bot.send_message(chat_id=target_chat_id, text=message)
-        # Remove from DB
+            app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='MarkdownV2', disable_web_page_preview=False)
         cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
         conn.commit()
     except Exception as e:
         logger.error(f"Error posting scheduled message: {e}")
 
-# --- /SCHEDULE COMMAND ---
-async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Button-driven scheduling ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("📅 Schedule Message", callback_data="schedule_start")]]
+    await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # List available groups
+    cur.execute("SELECT chat_id, title FROM groups")
+    groups = cur.fetchall()
+    if not groups:
+        await query.edit_message_text("No groups registered yet. Add me to groups as admin and use any command there first!")
+        return ConversationHandler.END
+    keyboard = [
+        [InlineKeyboardButton(f"{title}", callback_data=f"group_{chat_id}")]
+        for chat_id, title in groups
+    ]
+    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_GROUP
+
+async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    group_id = int(query.data.split("_")[1])
+    context.user_data['target_chat_id'] = group_id
+    # Fetch topics (for prototype, let user skip)
+    # If you want to list real topics, you'd need to fetch those from Telegram's API (requires extra logic)
+    # For now, offer "No Topic" as default, and let user enter topic ID if needed
+    keyboard = [
+        [InlineKeyboardButton("No topic (main chat)", callback_data="topic_none")],
+        [InlineKeyboardButton("Enter topic ID manually", callback_data="topic_manual")]
+    ]
+    await query.edit_message_text("Select topic (or skip):", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_TOPIC
+
+async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "topic_none":
+        context.user_data['topic_id'] = None
+        return await ask_time(update, context)
+    else:
+        await query.edit_message_text("Please reply with the **topic/thread ID** (send as a number).")
+        return CHOOSE_TOPIC
+
+async def set_topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic_id = update.message.text.strip()
+    if not topic_id.isdigit():
+        await update.message.reply_text("Invalid topic ID. Please send a number.")
+        return CHOOSE_TOPIC
+    context.user_data['topic_id'] = int(topic_id)
+    return await ask_time(update, context)
+
+async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Choose preset times or manual
+    now = datetime.now()
+    presets = [
+        ("In 5 min", now + timedelta(minutes=5)),
+        ("In 15 min", now + timedelta(minutes=15)),
+        ("Tomorrow 9AM", (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)),
+        ("Manual entry", None)
+    ]
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"time_{dt.strftime('%Y-%m-%d %H:%M') if dt else 'manual'}")]
+        for label, dt in presets
+    ]
+    msg = "Pick a time:"
+    if hasattr(update, "callback_query"):
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_TIME
+
+async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.replace("time_", "")
+    if data == "manual":
+        await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour clock).", parse_mode='Markdown')
+        return CHOOSE_TIME
+    else:
+        context.user_data['run_at'] = data
+        await query.edit_message_text(f"Time set to: {data}\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.")
+        return WRITE_MSG
+
+async def set_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
     try:
-        args = context.args
-        if len(args) < 4:
-            await update.message.reply_text(
-                "Usage:\n"
-                "/schedule <group_id|group_name> [topic_id] YYYY-MM-DD HH:MM message"
-            )
-            return
+        _ = datetime.strptime(txt, "%Y-%m-%d %H:%M")
+        context.user_data['run_at'] = txt
+        await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
+        return WRITE_MSG
+    except Exception:
+        await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr).")
+        return CHOOSE_TIME
 
-        # Parse group, topic, date, and time
-        group_ref = args[0]
-        topic_id = None
-        idx = 1
+async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['message'] = update.message.text
+    group = context.user_data.get('target_chat_id')
+    topic = context.user_data.get('topic_id')
+    run_at = context.user_data.get('run_at')
+    msg = f"Ready to schedule:\nGroup: `{group}`\n"
+    if topic:
+        msg += f"Topic ID: `{topic}`\n"
+    msg += f"Time: `{run_at}`\nMessage:\n\n{context.user_data['message']}\n\nConfirm?"
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]
+    ]
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return CONFIRM
 
-        # Try to parse topic ID if next argument is integer-like
-        try:
-            maybe_topic = int(args[1])
-            topic_id = maybe_topic
-            idx += 1
-        except ValueError:
-            topic_id = None
+async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "confirm_yes":
+        group = context.user_data['target_chat_id']
+        topic = context.user_data.get('topic_id')
+        run_at = context.user_data['run_at']
+        message = context.user_data['message']
+        user_id = query.from_user.id
+        run_at_dt = datetime.strptime(run_at, "%Y-%m-%d %H:%M")
 
-        date_str = args[idx]
-        time_str = args[idx + 1]
-        run_at_str = f"{date_str} {time_str}"
-        run_at = datetime.strptime(run_at_str, "%Y-%m-%d %H:%M")
-        message = ' '.join(args[idx + 2:])
-
-        # Find the group chat_id by name or ID
-        if group_ref.startswith('-'):
-            target_chat_id = int(group_ref)
-        else:
-            cur.execute("SELECT chat_id FROM groups WHERE title LIKE ?", (group_ref,))
-            res = cur.fetchone()
-            if not res:
-                await update.message.reply_text("Could not find group with that name. Try /groups to see available groups.")
-                return
-            target_chat_id = int(res[0])
-
-        # Save to DB
         cur.execute(
             "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at) VALUES (?, ?, ?, ?, ?)",
-            (target_chat_id, topic_id, update.effective_user.id, message, run_at.isoformat())
+            (group, topic, user_id, message, run_at_dt.isoformat())
         )
         conn.commit()
         schedule_id = cur.lastrowid
 
-        # Add to scheduler
         scheduler.add_job(
             post_scheduled_message,
             'date',
-            run_date=run_at,
-            args=[target_chat_id, topic_id, message, schedule_id],
+            run_date=run_at_dt,
+            args=[group, topic, message, schedule_id],
             id=str(schedule_id)
         )
+        await query.edit_message_text("✅ Scheduled!")
+    else:
+        await query.edit_message_text("Cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
-        info = f"Scheduled: \"{message}\" for {run_at.strftime('%Y-%m-%d %H:%M')}\nGroup: {group_ref}"
-        if topic_id:
-            info += f"\nTopic ID: {topic_id}"
-        await update.message.reply_text(info)
+# --- Group registration (as before) ---
+async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type in ['group', 'supergroup']:
+        register_group(update.effective_chat)
 
-    except Exception as e:
-        logger.error(e)
-        await update.message.reply_text("Error: Please check your format and try again.")
-
-# --- /MYSCHEDULES COMMAND ---
-async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur.execute(
-        "SELECT id, target_chat_id, topic_id, message, run_at FROM schedules WHERE user_id=? ORDER BY run_at ASC",
-        (update.effective_user.id,)
-    )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("You have no scheduled messages.")
-        return
-    msg = "Your scheduled messages:\n"
-    for row in rows:
-        msg += f"- [{row[0]}] {row[3]} at {row[4]} (chat_id: {row[1]}"
-        if row[2]:
-            msg += f", topic_id: {row[2]}"
-        msg += ")\n"
-    await update.message.reply_text(msg)
-
-# --- /GROUPS COMMAND ---
-async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur.execute("SELECT chat_id, title FROM groups")
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("No groups registered yet. Add this bot to your groups as admin, then send a message there to register.")
-        return
-    msg = "Groups:\n"
-    for row in rows:
-        msg += f"- {row[1]} (ID: {row[0]})\n"
-    msg += "\nUse the chat_id or group name in /schedule. For topics, use topic_id as 2nd argument if needed."
-    await update.message.reply_text(msg)
-
-# --- /WHEREAMI COMMAND ---
+# --- /whereami as before ---
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
@@ -165,21 +219,33 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\n(Not in a topic/thread right now.)"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-# --- REGISTER GROUPS WHEN BOT SEES MESSAGES IN GROUPS ---
-async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type in ['group', 'supergroup']:
-        register_group(update.effective_chat)
-
 def main():
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-    app_.add_handler(CommandHandler("schedule", schedule))
-    app_.add_handler(CommandHandler("myschedules", myschedules))
-    app_.add_handler(CommandHandler("groups", groups))
+    # --- Button-driven scheduler flow ---
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
+        states={
+            CHOOSE_GROUP: [CallbackQueryHandler(choose_group, pattern="^group_")],
+            CHOOSE_TOPIC: [
+                CallbackQueryHandler(choose_topic, pattern="^topic_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_topic_id)
+            ],
+            CHOOSE_TIME: [
+                CallbackQueryHandler(choose_time, pattern="^time_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_manual_time)
+            ],
+            WRITE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, write_msg)],
+            CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")]
+        },
+        fallbacks=[],
+        allow_reentry=True
+    )
+    app_.add_handler(conv_handler)
+    # --- Support for /whereami ---
     app_.add_handler(CommandHandler("whereami", whereami))
-    app_.add_handler(CommandHandler("start", register_chat_on_message))
-    app_.add_handler(CommandHandler("help", register_chat_on_message))
-    app_.add_handler(CommandHandler("register", register_chat_on_message))
-    app_.add_handler(CommandHandler("test", register_chat_on_message))
+    # --- Register groups when seeing any message in a group ---
+    from telegram.ext import MessageHandler, filters as tgfilters
+    app_.add_handler(MessageHandler(tgfilters.ALL, register_chat_on_message))
     logger.info("Bot running...")
     app_.run_polling()
 
