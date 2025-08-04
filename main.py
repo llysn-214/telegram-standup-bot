@@ -3,6 +3,7 @@ import sqlite3
 import os
 from datetime import datetime, timedelta
 import pytz
+import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -76,22 +77,61 @@ def register_topic(chat_id, topic_id, topic_name):
         logger.error(f"Failed to register topic: {e}")
 
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id):
-    try:
+    logger.info(f"Trying to send: chat_id={target_chat_id}, topic_id={topic_id}, message='{message}', schedule_id={schedule_id}")
+    async def send():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-        logger.info(f"Posting scheduled message: {message} to chat {target_chat_id}, topic {topic_id}")
-        if topic_id:
-            app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='MarkdownV2', disable_web_page_preview=False)
-        else:
-            app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='MarkdownV2', disable_web_page_preview=False)
-        cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error posting scheduled message: {e}")
+        try:
+            if topic_id:
+                await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='MarkdownV2', disable_web_page_preview=False)
+            else:
+                await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='MarkdownV2', disable_web_page_preview=False)
+            cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+            conn.commit()
+            logger.info(f"Message sent and schedule {schedule_id} deleted.")
+        except Exception as e:
+            logger.exception(f"Error posting scheduled message: {e}")
+
+    asyncio.run(send())
 
 # --- Button-driven scheduling ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📅 Schedule Message", callback_data="schedule_start")]]
     await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "*Available Commands:*\n\n"
+        "/start – Begin scheduling a message with guided buttons\n"
+        "/help – Show this help message\n"
+        "/whereami – Show the group and topic/thread ID (useful for admins and troubleshooting)\n"
+        "/cancel – Cancel the current operation (only when in scheduling flow)\n"
+        "/topicname [Display Name] – Set a human-friendly name for the current topic (use in topic)\n\n"
+        "*How to register groups/topics:*\n"
+        "- Add the bot as admin to your group (with permission to read messages)\n"
+        "- Send any message in the main chat and in each topic; the bot will 'learn' all topics it sees\n"
+        "- Use /topicname in a topic to give it a readable name\n\n"
+        "*How to schedule:*\n"
+        "1. DM or /start the bot\n"
+        "2. Tap 'Schedule Message' and follow the button prompts\n"
+        "3. Select group, topic, time (Asia/Manila), and type your message\n"
+        "4. Confirm to schedule\n"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ['group', 'supergroup']:
+        await update.message.reply_text("This command must be used in a group/topic.")
+        return
+    topic_id = getattr(update.message, "message_thread_id", None)
+    if topic_id is None:
+        await update.message.reply_text("This command must be used *inside a topic* (not main chat).")
+        return
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Usage: /topicname Actual Topic Name")
+        return
+    register_topic(update.effective_chat.id, topic_id, name)
+    await update.message.reply_text(f"Topic name for ID {topic_id} set to: {name}")
 
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -251,14 +291,12 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
         topic_id = getattr(update.message, "message_thread_id", None)
         topic_name = None
         if topic_id:
-            # Use the topic name if available (fallback to ID string)
-            # For python-telegram-bot, topic name is only available on certain updates
-            # We'll try to get it from the message's reply_to_message, otherwise just store the ID
-            topic_name = None
-            if hasattr(update.message, "forum_topic_created") and update.message.forum_topic_created:
-                topic_name = update.message.forum_topic_created.name
-            if not topic_name:
-                # fallback to ID string
+            # Try to use the topic name if available (via /topicname or learned earlier)
+            cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (update.effective_chat.id, topic_id))
+            row = cur.fetchone()
+            if row:
+                topic_name = row[0]
+            else:
                 topic_name = f"Topic {topic_id}"
         else:
             topic_id = 0
@@ -274,24 +312,6 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg += "\n(Not in a topic/thread right now.)"
     await update.message.reply_text(msg, parse_mode='Markdown')
-    
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "*Available Commands:*\n\n"
-        "/start – Begin scheduling a message with guided buttons\n"
-        "/help – Show this help message\n"
-        "/whereami – Show the group and topic/thread ID (useful for admins and troubleshooting)\n"
-        "/cancel – Cancel the current operation (only when in scheduling flow)\n\n"
-        "*How to register groups/topics:*\n"
-        "- Add the bot as admin to your group (with permission to read messages)\n"
-        "- Send any message in the main chat and in each topic; the bot will 'learn' all topics it sees\n\n"
-        "*How to schedule:*\n"
-        "1. DM or /start the bot\n"
-        "2. Tap 'Schedule Message' and follow the button prompts\n"
-        "3. Select group, topic, time (Asia/Manila), and type your message\n"
-        "4. Confirm to schedule\n"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 def run_telegram_bot():
     app_ = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -313,6 +333,7 @@ def run_telegram_bot():
     app_.add_handler(conv_handler)
     app_.add_handler(CommandHandler("help", help_command))
     app_.add_handler(CommandHandler("whereami", whereami))
+    app_.add_handler(CommandHandler("topicname", set_topic_name))
     app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
     logger.info("Bot running...")
     app_.run_polling()
