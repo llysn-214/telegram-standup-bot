@@ -12,6 +12,7 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler
 )
 from flask import Flask
+import html
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 10000))
@@ -73,7 +74,6 @@ main_asyncio_loop = None
 # --- Async Flood Control Queue ---
 send_queue = asyncio.Queue()
 
-# Thread-safe enqueue helper for jobs from any thread
 def safe_enqueue_send_job(send_job):
     global main_asyncio_loop
     try:
@@ -146,43 +146,43 @@ def register_topic(chat_id, topic_id, topic_name):
 # --- Bot commands and scheduling logic ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📅 Schedule Message", callback_data="schedule_start")]]
-    await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "*Available Commands:*\n\n"
+        "<b>Available Commands:</b>\n\n"
         "/start – Begin scheduling a message with guided buttons\n"
         "/help – Show this help message\n"
         "/myschedules – List and cancel your future scheduled messages\n"
         "/whereami – Show the group and topic/thread ID (useful for admins and troubleshooting)\n"
         "/cancel – Cancel the current operation (only when in scheduling flow)\n"
         "/topicname [Display Name] – Set a human-friendly name for the current topic (use in topic)\n\n"
-        "*How to register groups/topics:*\n"
+        "<b>How to register groups/topics:</b>\n"
         "- Add the bot as admin to your group (with permission to read messages)\n"
         "- Send any message in the main chat and in each topic; the bot will 'learn' all topics it sees\n"
         "- Use /topicname in a topic to give it a readable name\n\n"
-        "*How to schedule:*\n"
+        "<b>How to schedule:</b>\n"
         "1. DM or /start the bot\n"
         "2. Tap 'Schedule Message' and follow the button prompts\n"
         "3. Select group, topic, recurrence, time (Asia/Manila), and type your message\n"
         "4. Confirm to schedule\n"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text, parse_mode="HTML")
 
 async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("This command must be used in a group/topic.")
+        await update.message.reply_text("This command must be used in a group/topic.", parse_mode='HTML')
         return
     topic_id = getattr(update.message, "message_thread_id", None)
     if topic_id is None:
-        await update.message.reply_text("This command must be used *inside a topic* (not main chat).")
+        await update.message.reply_text("This command must be used <b>inside a topic</b> (not main chat).", parse_mode='HTML')
         return
     name = " ".join(context.args).strip()
     if not name:
-        await update.message.reply_text("Usage: /topicname Actual Topic Name")
+        await update.message.reply_text("Usage: /topicname Actual Topic Name", parse_mode='HTML')
         return
     register_topic(update.effective_chat.id, topic_id, name)
-    await update.message.reply_text(f"Topic name for ID {topic_id} set to: {name}")
+    await update.message.reply_text(f"Topic name for ID {topic_id} set to: <b>{html.escape(name)}</b>", parse_mode='HTML')
 
 async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -192,7 +192,7 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     schedules = cur.fetchall()
     if not schedules:
-        await update.message.reply_text("You have no scheduled messages.")
+        await update.message.reply_text("You have no scheduled messages.", parse_mode='HTML')
         return
 
     for sched in schedules:
@@ -207,9 +207,9 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tname = trow[0] if trow else f"Topic {topic_id}"
         dt = datetime.fromisoformat(run_at)
         dt_ph = dt.astimezone(PH_TZ)
-        preview = msg[:60].replace('\n', ' ') + ("..." if len(msg) > 60 else "")
-        text = f"<b>Group:</b> {group_name}\n"
-        text += f"<b>Topic:</b> {tname if tname else 'Main chat'}\n"
+        preview = html.escape(msg[:60].replace('\n', ' ') + ("..." if len(msg) > 60 else ""))
+        text = f"<b>Group:</b> {html.escape(group_name)}\n"
+        text += f"<b>Topic:</b> {html.escape(tname) if tname else 'Main chat'}\n"
         if recurrence == "weekly":
             weekday, at_time = recurrence_data.split(":")
             text += f"<b>Repeats:</b> Every {weekday} {at_time} Asia/Manila\n"
@@ -233,7 +233,7 @@ async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     cur.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
     conn.commit()
-    await query.edit_message_text("❌ Scheduled message cancelled.")
+    await query.edit_message_text("❌ Scheduled message cancelled.", parse_mode='HTML')
 
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -241,13 +241,13 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT chat_id, title FROM groups")
     groups = cur.fetchall()
     if not groups:
-        await query.edit_message_text("No groups registered yet. Add me to groups as admin and use any command there first!")
+        await query.edit_message_text("No groups registered yet. Add me to groups as admin and use any command there first!", parse_mode='HTML')
         return ConversationHandler.END
     keyboard = [
         [InlineKeyboardButton(f"{title}", callback_data=f"group_{chat_id}")]
         for chat_id, title in groups
     ]
-    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return CHOOSE_GROUP
 
 async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +263,7 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(
             "No topics found yet for this group. The bot will learn topics as it sees them. For now, you can only use Main chat.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return CHOOSE_TOPIC
 
@@ -271,7 +271,7 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(topic_name, callback_data=f"topic_{topic_id}")]
         for topic_id, topic_name in topics
     ]
-    await query.edit_message_text("Choose a topic (or main chat):", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text("Choose a topic (or main chat):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return CHOOSE_TOPIC
 
 async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,7 +288,7 @@ async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.edit_message_text(
         "Do you want this message to repeat?\n\nSelect a day to repeat weekly or pick 'One time only'.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
     )
     return CHOOSE_RECURRENCE
 
@@ -303,7 +303,7 @@ async def choose_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day = data.split("_")[-1]
         context.user_data['recurrence'] = "weekly"
         context.user_data['weekday'] = day
-        await query.edit_message_text(f"Enter the time (24h, Asia/Manila) for every {day}, e.g. 13:00 for 1PM.")
+        await query.edit_message_text(f"Enter the time (24h, Asia/Manila) for every {day}, e.g. 13:00 for 1PM.", parse_mode='HTML')
         return CHOOSE_TIME
 
 async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,9 +320,9 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     msg = "Pick a time (Asia/Manila):"
     if getattr(update, "callback_query", None):
-        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     else:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return CHOOSE_TIME
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,11 +331,11 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         data = query.data.replace("time_", "")
         if data == "manual":
-            await query.edit_message_text("Reply with date and time in `YYYY-MM-DD HH:MM` format (24-hour, Asia/Manila).\n\nType /cancel to abort.", parse_mode='Markdown')
+            await query.edit_message_text("Reply with date and time in <code>YYYY-MM-DD HH:MM</code> format (24-hour, Asia/Manila).<br><br>Type /cancel to abort.", parse_mode='HTML')
             return CHOOSE_TIME
         else:
             context.user_data['run_at'] = data
-            await query.edit_message_text(f"Time set to: {data} (Asia/Manila)\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.")
+            await query.edit_message_text(f"Time set to: <code>{html.escape(data)}</code> (Asia/Manila)<br>Now, please send your message.<br><br>You can mention users with @username and add links, emojis, etc.", parse_mode='HTML')
             return WRITE_MSG
     else:
         txt = update.message.text.strip()
@@ -343,20 +343,20 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 dt_time.fromisoformat(txt)
                 context.user_data['recurr_time'] = txt
-                await update.message.reply_text(f"Time set to {txt}. Now, please send your message text.")
+                await update.message.reply_text(f"Time set to <code>{html.escape(txt)}</code>. Now, please send your message text.", parse_mode='HTML')
                 return WRITE_MSG
             except Exception:
-                await update.message.reply_text("Invalid format. Use HH:MM (e.g. 13:00 for 1PM).")
+                await update.message.reply_text("Invalid format. Use <code>HH:MM</code> (e.g. 13:00 for 1PM).", parse_mode='HTML')
                 return CHOOSE_TIME
         else:
             try:
                 dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
                 dt = PH_TZ.localize(dt)
                 context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
-                await update.message.reply_text("Time set! Now, please send your message text.\n(You can tag users or add links.)")
+                await update.message.reply_text("Time set! Now, please send your message text.<br>(You can tag users or add links.)", parse_mode='HTML')
                 return WRITE_MSG
             except Exception:
-                await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM (24hr), or type /cancel.")
+                await update.message.reply_text("Invalid format. Please use <code>YYYY-MM-DD HH:MM</code> (24hr), or type /cancel.", parse_mode='HTML')
                 return CHOOSE_TIME
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -364,27 +364,27 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
     recurrence = context.user_data.get('recurrence', "none")
-    msg = f"Ready to schedule:\nGroup: `{group}`\n"
+    msg = f"Ready to schedule:<br>Group: <code>{group}</code><br>"
     if topic:
         cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (group, topic))
         tname = cur.fetchone()
         if tname:
-            msg += f"Topic: `{tname[0]}`\n"
+            msg += f"Topic: <code>{html.escape(tname[0])}</code><br>"
         else:
-            msg += f"Topic ID: `{topic}`\n"
+            msg += f"Topic ID: <code>{topic}</code><br>"
     if recurrence == "weekly":
         weekday = context.user_data['weekday']
         at_time = context.user_data['recurr_time']
-        msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)\n"
+        msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)<br>"
     else:
         run_at = context.user_data.get('run_at')
-        msg += f"Time: `{run_at}` (Asia/Manila)\n"
-    msg += f"Message:\n\n{context.user_data['message']}\n\nConfirm?"
+        msg += f"Time: <code>{html.escape(run_at)}</code> (Asia/Manila)<br>"
+    msg += f"Message:<br><code>{html.escape(context.user_data['message'])}</code><br><br>Confirm?"
     keyboard = [
         [InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]
     ]
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     return CONFIRM
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,7 +422,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 args=[group, topic, message, schedule_id, "weekly"],
                 id=str(schedule_id)
             )
-            await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!")
+            await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!", parse_mode='HTML')
         else:
             run_at = context.user_data['run_at']
             dt_ph = PH_TZ.localize(datetime.strptime(run_at, "%Y-%m-%d %H:%M"))
@@ -440,14 +440,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 args=[group, topic, message, schedule_id, "none"],
                 id=str(schedule_id)
             )
-            await query.edit_message_text("✅ One-time scheduled message set!")
+            await query.edit_message_text("✅ One-time scheduled message set!", parse_mode='HTML')
     else:
-        await query.edit_message_text("Cancelled.")
+        await query.edit_message_text("Cancelled.", parse_mode='HTML')
     context.user_data.clear()
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Scheduling cancelled.")
+    await update.message.reply_text("Scheduling cancelled.", parse_mode='HTML')
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -471,12 +471,12 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
-    msg = f"Chat ID: `{chat_id}`"
+    msg = f"Chat ID: <code>{chat_id}</code>"
     if msg_thread_id:
-        msg += f"\nTopic (Thread) ID: `{msg_thread_id}`"
+        msg += f"\nTopic (Thread) ID: <code>{msg_thread_id}</code>"
     else:
         msg += "\n(Not in a topic/thread right now.)"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 def run_telegram_bot():
     global main_asyncio_loop
