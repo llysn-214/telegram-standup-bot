@@ -3,10 +3,11 @@ import sqlite3
 import os
 import asyncio
 import threading
+import json
 from datetime import datetime, timedelta, time as dt_time
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, filters, ConversationHandler
@@ -33,17 +34,9 @@ cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     message TEXT,
     run_at TEXT,
     recurrence TEXT DEFAULT 'none',
-    recurrence_data TEXT
+    recurrence_data TEXT,
+    entities TEXT
 )''')
-try:
-    cur.execute("ALTER TABLE schedules ADD COLUMN recurrence TEXT DEFAULT 'none'")
-except sqlite3.OperationalError:
-    pass
-try:
-    cur.execute("ALTER TABLE schedules ADD COLUMN recurrence_data TEXT")
-except sqlite3.OperationalError:
-    pass
-
 cur.execute('''CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
     title TEXT
@@ -114,12 +107,33 @@ async def flood_control_worker():
         send_queue.task_done()
 
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
+    # Load entities from DB
+    cur.execute("SELECT entities FROM schedules WHERE id=?", (schedule_id,))
+    row = cur.fetchone()
+    entities = None
+    if row and row[0]:
+        try:
+            entities = [MessageEntity.de_json(e, None) for e in json.loads(row[0])]
+        except Exception:
+            entities = None
+
     async def send_job():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
         if topic_id:
-            msg_obj = await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
+            msg_obj = await app_.bot.send_message(
+                chat_id=target_chat_id,
+                text=message,
+                message_thread_id=int(topic_id),
+                entities=entities if entities else None,
+                disable_web_page_preview=False
+            )
         else:
-            msg_obj = await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML', disable_web_page_preview=False)
+            msg_obj = await app_.bot.send_message(
+                chat_id=target_chat_id,
+                text=message,
+                entities=entities if entities else None,
+                disable_web_page_preview=False
+            )
         logger.info(f"Sent message for schedule {schedule_id}")
 
         # --- Standup follow-up logic ---
@@ -130,7 +144,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                 (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline))
         conn.commit()
         if usernames:
-            # schedule check
             scheduler.add_job(
                 followup_check_standups,
                 'date',
@@ -138,7 +151,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                 args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
             )
 
-        # Remove one-time jobs from DB after sending
         if recurrence == "none":
             cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
             conn.commit()
@@ -157,17 +169,14 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
             await app_.bot.send_message(
                 chat_id=chat_id, 
                 text=msg,
-                message_thread_id=int(topic_id) if topic_id else None,
-                parse_mode='HTML'
+                message_thread_id=int(topic_id) if topic_id else None
             )
         safe_enqueue_send_job(send_followup)
-    # Clean up tracked standup
     cur.execute("DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?", 
                 (schedule_id, chat_id, topic_id, standup_message_id))
     conn.commit()
 
-# --- Conversation states ---
-CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_DAY, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(7)
+CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(6)
 
 def register_group(chat):
     try:
@@ -186,7 +195,6 @@ def register_topic(chat_id, topic_id, topic_name):
     except Exception as e:
         logger.error(f"Failed to register topic: {e}")
 
-# --- Bot commands and scheduling logic ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📅 Schedule Message", callback_data="schedule_start")]]
     await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -202,7 +210,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/topicname [Display Name] – Set a human-friendly name for the current topic (use in topic)\n\n"
         "<b>How to register groups/topics:</b>\n"
         "- Add the bot as admin to your group (with permission to read messages)\n"
-        "- Send any message in the main chat and in each topic; the bot will 'learn' all topics it sees\n"
+        "- Use /topicname in a topic to register it (the bot only schedules to named topics)\n"
         "- Use /topicname in a topic to give it a readable name\n\n"
         "<b>How to schedule:</b>\n"
         "1. DM or /start the bot\n"
@@ -298,14 +306,18 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group_id = int(query.data.split("_")[1])
     context.user_data['target_chat_id'] = group_id
-    cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id = ?", (group_id,))
+
+    # Only include topics that have been named with /topicname and are not default "Topic ###"
+    cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id = ? AND topic_id != 0 AND topic_name != '' AND topic_name NOT LIKE 'Topic %'", (group_id,))
     topics = cur.fetchall()
-    if not topics:
+    # Always allow Main chat
+    topics.insert(0, (0, "Main chat"))
+    if len(topics) == 1:  # only main chat
         keyboard = [
             [InlineKeyboardButton("Main chat (no topic)", callback_data="topic_0")]
         ]
         await query.edit_message_text(
-            "No topics found yet for this group. The bot will learn topics as it sees them. For now, you can only use Main chat.",
+            "No named topics found for this group. Use <code>/topicname [Display Name]</code> in a topic to register it for scheduling.",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
         )
         return CHOOSE_TOPIC
@@ -381,7 +393,7 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data['run_at'] = data
             await query.edit_message_text(
-                f"Time set to: <code>{html.escape(data)}</code> (Asia/Manila)\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.", 
+                f"Time set to: <code>{html.escape(data)}</code> (Asia/Manila)\nNow, please send your message.\n\nYou can use Telegram's rich text formatting (bold, italics, etc) and emojis!", 
                 parse_mode='HTML')
             return WRITE_MSG
     else:
@@ -403,7 +415,7 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 dt = PH_TZ.localize(dt)
                 context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
                 await update.message.reply_text(
-                    "Time set! Now, please send your message text.\n(You can tag users or add links.)", 
+                    "Time set! Now, please send your message text.\n(You can use Telegram's formatting.)", 
                     parse_mode='HTML')
                 return WRITE_MSG
             except Exception:
@@ -412,6 +424,11 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['message'] = update.message.text
+    # Save formatting entities as JSON
+    if update.message.entities:
+        context.user_data['entities'] = json.dumps([e.to_dict() for e in update.message.entities])
+    else:
+        context.user_data['entities'] = None
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
     recurrence = context.user_data.get('recurrence', "none")
@@ -447,6 +464,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = context.user_data['message']
         user_id = query.from_user.id
         recurrence = context.user_data.get('recurrence', "none")
+        entities = context.user_data.get('entities')
         if recurrence == "weekly":
             weekday = context.user_data['weekday']
             at_time = context.user_data['recurr_time']
@@ -459,8 +477,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             next_dt = next_dt.replace(hour=int(at_time.split(":")[0]), minute=int(at_time.split(":")[1]), second=0, microsecond=0)
             dt_utc = PH_TZ.localize(next_dt).astimezone(pytz.utc)
             cur.execute(
-                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (group, topic, user_id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{at_time}")
+                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data, entities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (group, topic, user_id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{at_time}", entities)
             )
             conn.commit()
             schedule_id = cur.lastrowid
@@ -479,8 +497,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt_ph = PH_TZ.localize(datetime.strptime(run_at, "%Y-%m-%d %H:%M"))
             dt_utc = dt_ph.astimezone(pytz.utc)
             cur.execute(
-                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence) VALUES (?, ?, ?, ?, ?, ?)",
-                (group, topic, user_id, message, dt_utc.isoformat(), "none")
+                "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, entities) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (group, topic, user_id, message, dt_utc.isoformat(), "none", entities)
             )
             conn.commit()
             schedule_id = cur.lastrowid
@@ -506,18 +524,9 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
     if update.effective_chat.type in ['group', 'supergroup']:
         register_group(update.effective_chat)
         topic_id = getattr(update.message, "message_thread_id", None)
-        topic_name = None
-        if topic_id:
-            cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (update.effective_chat.id, topic_id))
-            row = cur.fetchone()
-            if row:
-                topic_name = row[0]
-            else:
-                topic_name = f"Topic {topic_id}"
-        else:
-            topic_id = 0
-            topic_name = "Main chat"
-        register_topic(update.effective_chat.id, topic_id, topic_name)
+        # Only register "main chat" automatically
+        if topic_id is None or topic_id == 0:
+            register_topic(update.effective_chat.id, 0, "Main chat")
 
         # --- Standup reply tracking (must reply to bot's standup message) ---
         if getattr(update.message, "reply_to_message", None):
@@ -532,7 +541,6 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
             if row:
                 cur.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                 conn.commit()
-                # Thank you message!
                 try:
                     await update.message.reply_text("Thanks for sending your standup! 🙌 Keep up the great work!", parse_mode='HTML')
                 except Exception as e:
