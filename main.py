@@ -270,8 +270,11 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"<b>Group:</b> {html.escape(group_name)}\n"
         text += f"<b>Topic:</b> {html.escape(tname) if tname else 'Main chat'}\n"
         if recurrence == "weekly":
-            weekday, at_time = recurrence_data.split(":")
+            parts = recurrence_data.split(":")
+            weekday = parts[0]
+            at_time = ":".join(parts[1:]) if len(parts) > 1 else ""
             text += f"<b>Repeats:</b> Every {weekday} {at_time} Asia/Manila\n"
+
         else:
             text += f"<b>When:</b> {dt_ph.strftime('%Y-%m-%d %H:%M')} Asia/Manila\n"
         text += f"<b>Message:</b> <code>{preview}</code>"
