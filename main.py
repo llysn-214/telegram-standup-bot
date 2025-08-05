@@ -552,13 +552,18 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                     conn_local.commit()
                     try:
-                        await context.bot.send_reaction(
-                            chat_id=update.effective_chat.id,
-                            message_id=update.message.message_id,
-                            emoji="👍"
-                            )
+                            # v21+: send_reaction, v20: fallback to "Thanks!"
+                            send_react = getattr(context.bot, "send_reaction", None)
+                        if send_react:
+                            await send_react(
+                                chat_id=update.effective_chat.id,
+                                message_id=update.message.message_id,
+                                emoji="👍"
+                                )
+                        else:
+                            await update.message.reply_text("Thanks!")
                     except Exception as e:
-                        logger.error(f"Failed to react: {e}")
+                        logger.error(f"Failed to react or thank: {e}")
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
