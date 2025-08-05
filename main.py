@@ -107,15 +107,17 @@ async def flood_control_worker():
         send_queue.task_done()
 
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
-    # Load entities from DB
-    cur.execute("SELECT entities FROM schedules WHERE id=?", (schedule_id,))
-    row = cur.fetchone()
-    entities = None
-    if row and row[0]:
-        try:
-            entities = [MessageEntity.de_json(e, None) for e in json.loads(row[0])]
-        except Exception:
-            entities = None
+    # Always use a fresh connection and cursor for jobs
+    with sqlite3.connect('schedules.db') as conn_local:
+        cur_local = conn_local.cursor()
+        cur_local.execute("SELECT entities FROM schedules WHERE id=?", (schedule_id,))
+        row = cur_local.fetchone()
+        entities = None
+        if row and row[0]:
+            try:
+                entities = [MessageEntity.de_json(e, None) for e in json.loads(row[0])]
+            except Exception:
+                entities = None
 
     async def send_job():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -136,13 +138,15 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
             )
         logger.info(f"Sent message for schedule {schedule_id}")
 
-        # --- Standup follow-up logic ---
+        # Standup follow-up logic - always use a new conn/cursor
         usernames = set(re.findall(r'@(\w+)', message))
         deadline = (datetime.utcnow() + timedelta(hours=2)).isoformat()
-        for uname in usernames:
-            cur.execute("INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) VALUES (?, ?, ?, ?, ?, ?)",
-                (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline))
-        conn.commit()
+        with sqlite3.connect('schedules.db') as conn_local2:
+            cur_local2 = conn_local2.cursor()
+            for uname in usernames:
+                cur_local2.execute("INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) VALUES (?, ?, ?, ?, ?, ?)",
+                    (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline))
+            conn_local2.commit()
         if usernames:
             scheduler.add_job(
                 followup_check_standups,
@@ -152,29 +156,33 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
             )
 
         if recurrence == "none":
-            cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
-            conn.commit()
+            with sqlite3.connect('schedules.db') as conn_local3:
+                cur_local3 = conn_local3.cursor()
+                cur_local3.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+                conn_local3.commit()
 
     safe_enqueue_send_job(send_job)
 
 def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
-    cur.execute("SELECT username FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? AND done=0", 
-                (schedule_id, chat_id, topic_id, standup_message_id))
-    users = [row[0] for row in cur.fetchall()]
-    if users:
-        mention_text = " ".join([f"@{uname}" for uname in users])
-        msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
-        async def send_followup():
-            app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-            await app_.bot.send_message(
-                chat_id=chat_id, 
-                text=msg,
-                message_thread_id=int(topic_id) if topic_id else None
-            )
-        safe_enqueue_send_job(send_followup)
-    cur.execute("DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?", 
-                (schedule_id, chat_id, topic_id, standup_message_id))
-    conn.commit()
+    with sqlite3.connect('schedules.db') as conn_local:
+        cur_local = conn_local.cursor()
+        cur_local.execute("SELECT username FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? AND done=0", 
+                    (schedule_id, chat_id, topic_id, standup_message_id))
+        users = [row[0] for row in cur_local.fetchall()]
+        if users:
+            mention_text = " ".join([f"@{uname}" for uname in users])
+            msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
+            async def send_followup():
+                app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+                await app_.bot.send_message(
+                    chat_id=chat_id, 
+                    text=msg,
+                    message_thread_id=int(topic_id) if topic_id else None
+                )
+            safe_enqueue_send_job(send_followup)
+        cur_local.execute("DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?", 
+                    (schedule_id, chat_id, topic_id, standup_message_id))
+        conn_local.commit()
 
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(6)
 
@@ -533,19 +541,20 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
             replied_id = update.message.reply_to_message.message_id
             user = update.effective_user
             username = user.username.lower() if user.username else ""
-            cur.execute(
-                "SELECT id FROM standup_tracking WHERE standup_message_id=? AND chat_id=? AND topic_id=? AND username=? AND done=0",
-                (replied_id, update.effective_chat.id, getattr(update.message, "message_thread_id", None), username)
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
-                conn.commit()
-                try:
-                    # React with 👍 (thumbs up)
-                    await update.message.react("👍")
-                except Exception as e:
-                    logger.error(f"Failed to react: {e}")
+            with sqlite3.connect('schedules.db') as conn_local:
+                cur_local = conn_local.cursor()
+                cur_local.execute(
+                    "SELECT id FROM standup_tracking WHERE standup_message_id=? AND chat_id=? AND topic_id=? AND username=? AND done=0",
+                    (replied_id, update.effective_chat.id, getattr(update.message, "message_thread_id", None), username)
+                )
+                row = cur_local.fetchone()
+                if row:
+                    cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
+                    conn_local.commit()
+                    try:
+                        await update.message.react("👍")
+                    except Exception as e:
+                        logger.error(f"Failed to react: {e}")
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
