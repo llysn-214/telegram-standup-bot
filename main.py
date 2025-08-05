@@ -488,7 +488,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if days_ahead != 0:
                 candidate_dt += timedelta(days=days_ahead)
             candidate_dt = candidate_dt.replace(hour=at_time_obj.hour, minute=at_time_obj.minute, second=0, microsecond=0)
-            dt_utc = PH_TZ.localize(candidate_dt).astimezone(pytz.utc)
+            dt_utc = candidate_dt.astimezone(pytz.utc)
             cur.execute(
                 "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data, entities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (group, topic, user_id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{at_time}", entities)
