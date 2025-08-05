@@ -480,8 +480,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
             day_idx = week_days.index(weekday)
             next_dt = dt_now
-            while next_dt.weekday() != day_idx or next_dt.time() > dt_time.fromisoformat(at_time):
+            looped = 0
+            # PATCH: Only try max 7 times to avoid infinite loop / date overflow
+            while (next_dt.weekday() != day_idx or next_dt.time() > dt_time.fromisoformat(at_time)) and looped < 7:
                 next_dt += timedelta(days=1)
+                looped += 1
+            if looped >= 7:
+                await query.edit_message_text("❌ Failed to schedule: Could not find a valid date for the next occurrence. Please check your time input.", parse_mode='HTML')
+                context.user_data.clear()
+                return ConversationHandler.END
+
             next_dt = next_dt.replace(hour=int(at_time.split(":")[0]), minute=int(at_time.split(":")[1]), second=0, microsecond=0)
             dt_utc = PH_TZ.localize(next_dt).astimezone(pytz.utc)
             cur.execute(
@@ -552,18 +560,9 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                     conn_local.commit()
                     try:
-                        # v21+: send_reaction, v20: fallback to "Thanks!"
-                        send_react = getattr(context.bot, "send_reaction", None)
-                        if send_react:
-                            await send_react(
-                                chat_id=update.effective_chat.id,
-                                message_id=update.message.message_id,
-                                emoji="👍"
-                            )
-                        else:
-                            await update.message.reply_text("Thanks!")
+                        await update.message.reply_text("👍 Thanks for sending your standup!", quote=True)
                     except Exception as e:
-                        logger.error(f"Failed to react or thank: {e}")
+                        logger.error(f"Failed to react: {e}")
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
