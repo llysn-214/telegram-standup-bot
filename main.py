@@ -331,11 +331,15 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         data = query.data.replace("time_", "")
         if data == "manual":
-            await query.edit_message_text("Reply with date and time in <code>YYYY-MM-DD HH:MM</code> format (24-hour, Asia/Manila).<br><br>Type /cancel to abort.", parse_mode='HTML')
+            await query.edit_message_text(
+                "Reply with date and time in <code>YYYY-MM-DD HH:MM</code> format (24-hour, Asia/Manila).\n\nType /cancel to abort.", 
+                parse_mode='HTML')
             return CHOOSE_TIME
         else:
             context.user_data['run_at'] = data
-            await query.edit_message_text(f"Time set to: <code>{html.escape(data)}</code> (Asia/Manila)<br>Now, please send your message.<br><br>You can mention users with @username and add links, emojis, etc.", parse_mode='HTML')
+            await query.edit_message_text(
+                f"Time set to: <code>{html.escape(data)}</code> (Asia/Manila)\nNow, please send your message.\n\nYou can mention users with @username and add links, emojis, etc.", 
+                parse_mode='HTML')
             return WRITE_MSG
     else:
         txt = update.message.text.strip()
@@ -343,7 +347,9 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 dt_time.fromisoformat(txt)
                 context.user_data['recurr_time'] = txt
-                await update.message.reply_text(f"Time set to <code>{html.escape(txt)}</code>. Now, please send your message text.", parse_mode='HTML')
+                await update.message.reply_text(
+                    f"Time set to <code>{html.escape(txt)}</code>. Now, please send your message text.", 
+                    parse_mode='HTML')
                 return WRITE_MSG
             except Exception:
                 await update.message.reply_text("Invalid format. Use <code>HH:MM</code> (e.g. 13:00 for 1PM).", parse_mode='HTML')
@@ -353,7 +359,9 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
                 dt = PH_TZ.localize(dt)
                 context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
-                await update.message.reply_text("Time set! Now, please send your message text.<br>(You can tag users or add links.)", parse_mode='HTML')
+                await update.message.reply_text(
+                    "Time set! Now, please send your message text.\n(You can tag users or add links.)", 
+                    parse_mode='HTML')
                 return WRITE_MSG
             except Exception:
                 await update.message.reply_text("Invalid format. Please use <code>YYYY-MM-DD HH:MM</code> (24hr), or type /cancel.", parse_mode='HTML')
@@ -364,22 +372,22 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
     recurrence = context.user_data.get('recurrence', "none")
-    msg = f"Ready to schedule:<br>Group: <code>{group}</code><br>"
+    msg = f"Ready to schedule:\nGroup: <code>{group}</code>\n"
     if topic:
         cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (group, topic))
         tname = cur.fetchone()
         if tname:
-            msg += f"Topic: <code>{html.escape(tname[0])}</code><br>"
+            msg += f"Topic: <code>{html.escape(tname[0])}</code>\n"
         else:
-            msg += f"Topic ID: <code>{topic}</code><br>"
+            msg += f"Topic ID: <code>{topic}</code>\n"
     if recurrence == "weekly":
         weekday = context.user_data['weekday']
         at_time = context.user_data['recurr_time']
-        msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)<br>"
+        msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)\n"
     else:
         run_at = context.user_data.get('run_at')
-        msg += f"Time: <code>{html.escape(run_at)}</code> (Asia/Manila)<br>"
-    msg += f"Message:<br><code>{html.escape(context.user_data['message'])}</code><br><br>Confirm?"
+        msg += f"Time: <code>{html.escape(run_at)}</code> (Asia/Manila)\n"
+    msg += f"Message:\n<code>{html.escape(context.user_data['message'])}</code>\n\nConfirm?"
     keyboard = [
         [InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]
