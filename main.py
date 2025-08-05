@@ -478,6 +478,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             at_time = context.user_data['recurr_time']
             dt_now = datetime.now(PH_TZ)
             week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+            weekday_abbrs = ['mon','tue','wed','thu','fri','sat','sun']
             day_idx = week_days.index(weekday)
             # Improved "next weekly occurrence" calculation
             at_time_obj = dt_time.fromisoformat(at_time)
@@ -498,7 +499,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scheduler.add_job(
                 post_scheduled_message,
                 'cron',
-                day_of_week=weekday.lower(),
+                day_of_week=weekday_abbrs[day_idx],  # <-- PATCHED!
                 hour=int(at_time.split(":")[0]),
                 minute=int(at_time.split(":")[1]),
                 args=[group, topic, message, schedule_id, "weekly"],
