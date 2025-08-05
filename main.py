@@ -552,7 +552,11 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                     conn_local.commit()
                     try:
-                        await update.message.react("👍")
+                        await context.bot.send_reaction(
+                            chat_id=update.effective_chat.id,
+                            message_id=update.message.message_id,
+                            emoji="👍"
+                            )
                     except Exception as e:
                         logger.error(f"Failed to react: {e}")
 
