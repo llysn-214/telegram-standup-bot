@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 from flask import Flask
 import html
+import re
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 10000))
@@ -52,6 +53,17 @@ cur.execute('''CREATE TABLE IF NOT EXISTS topics (
     topic_id INTEGER,
     topic_name TEXT,
     PRIMARY KEY (chat_id, topic_id)
+)''')
+cur.execute('''CREATE TABLE IF NOT EXISTS standup_tracking (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id INTEGER,
+    chat_id INTEGER,
+    topic_id INTEGER,
+    standup_message_id INTEGER,
+    user_id INTEGER,
+    username TEXT,
+    done INTEGER DEFAULT 0,
+    deadline TEXT
 )''')
 conn.commit()
 
@@ -104,24 +116,55 @@ async def flood_control_worker():
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
     async def send_job():
         app_ = ApplicationBuilder().token(BOT_TOKEN).build()
-        for attempt in range(1, 4):
-            try:
-                if topic_id:
-                    await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
-                else:
-                    await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML', disable_web_page_preview=False)
-                logger.info(f"Sent message for schedule {schedule_id} (try {attempt})")
-                if recurrence == "none":
-                    cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
-                    conn.commit()
-                return
-            except Exception as e:
-                logger.error(f"Error sending schedule {schedule_id}, try {attempt}: {e}")
-                if attempt < 3:
-                    await asyncio.sleep(3)
-        logger.error(f"All retries failed for schedule {schedule_id}.")
+        if topic_id:
+            msg_obj = await app_.bot.send_message(chat_id=target_chat_id, text=message, message_thread_id=int(topic_id), parse_mode='HTML', disable_web_page_preview=False)
+        else:
+            msg_obj = await app_.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML', disable_web_page_preview=False)
+        logger.info(f"Sent message for schedule {schedule_id}")
+
+        # --- Standup follow-up logic ---
+        usernames = set(re.findall(r'@(\w+)', message))
+        deadline = (datetime.utcnow() + timedelta(hours=2)).isoformat()
+        for uname in usernames:
+            cur.execute("INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) VALUES (?, ?, ?, ?, ?, ?)",
+                (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline))
+        conn.commit()
+        if usernames:
+            # schedule check
+            scheduler.add_job(
+                followup_check_standups,
+                'date',
+                run_date=datetime.utcnow() + timedelta(hours=2),
+                args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
+            )
+
+        # Remove one-time jobs from DB after sending
+        if recurrence == "none":
+            cur.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+            conn.commit()
 
     safe_enqueue_send_job(send_job)
+
+def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
+    cur.execute("SELECT username FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? AND done=0", 
+                (schedule_id, chat_id, topic_id, standup_message_id))
+    users = [row[0] for row in cur.fetchall()]
+    if users:
+        mention_text = " ".join([f"@{uname}" for uname in users])
+        msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
+        async def send_followup():
+            app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+            await app_.bot.send_message(
+                chat_id=chat_id, 
+                text=msg,
+                message_thread_id=int(topic_id) if topic_id else None,
+                parse_mode='HTML'
+            )
+        safe_enqueue_send_job(send_followup)
+    # Clean up tracked standup
+    cur.execute("DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?", 
+                (schedule_id, chat_id, topic_id, standup_message_id))
+    conn.commit()
 
 # --- Conversation states ---
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_DAY, CHOOSE_TIME, WRITE_MSG, CONFIRM = range(7)
@@ -475,6 +518,25 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
             topic_id = 0
             topic_name = "Main chat"
         register_topic(update.effective_chat.id, topic_id, topic_name)
+
+        # --- Standup reply tracking (must reply to bot's standup message) ---
+        if getattr(update.message, "reply_to_message", None):
+            replied_id = update.message.reply_to_message.message_id
+            user = update.effective_user
+            username = user.username.lower() if user.username else ""
+            cur.execute(
+                "SELECT id FROM standup_tracking WHERE standup_message_id=? AND chat_id=? AND topic_id=? AND username=? AND done=0",
+                (replied_id, update.effective_chat.id, getattr(update.message, "message_thread_id", None), username)
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
+                conn.commit()
+                # Thank you message!
+                try:
+                    await update.message.reply_text("Thanks for sending your standup! 🙌 Keep up the great work!", parse_mode='HTML')
+                except Exception as e:
+                    logger.error(f"Failed to send thank you message: {e}")
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
