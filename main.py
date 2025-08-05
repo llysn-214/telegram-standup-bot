@@ -542,9 +542,10 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 cur.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                 conn.commit()
                 try:
-                    await update.message.reply_text("Thanks for sending your standup!🙌", parse_mode='HTML')
+                    # React with 👍 (thumbs up)
+                    await update.message.react("👍")
                 except Exception as e:
-                    logger.error(f"Failed to send thank you message: {e}")
+                    logger.error(f"Failed to react: {e}")
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
