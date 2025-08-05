@@ -479,19 +479,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt_now = datetime.now(PH_TZ)
             week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
             day_idx = week_days.index(weekday)
-            next_dt = dt_now
-            looped = 0
-            # PATCH: Only try max 7 times to avoid infinite loop / date overflow
-            while (next_dt.weekday() != day_idx or next_dt.time() > dt_time.fromisoformat(at_time)) and looped < 7:
-                next_dt += timedelta(days=1)
-                looped += 1
-            if looped >= 7:
-                await query.edit_message_text("❌ Failed to schedule: Could not find a valid date for the next occurrence. Please check your time input.", parse_mode='HTML')
-                context.user_data.clear()
-                return ConversationHandler.END
-
-            next_dt = next_dt.replace(hour=int(at_time.split(":")[0]), minute=int(at_time.split(":")[1]), second=0, microsecond=0)
-            dt_utc = PH_TZ.localize(next_dt).astimezone(pytz.utc)
+            # Improved "next weekly occurrence" calculation
+            at_time_obj = dt_time.fromisoformat(at_time)
+            days_ahead = (day_idx - dt_now.weekday()) % 7
+            candidate_dt = dt_now.replace(hour=at_time_obj.hour, minute=at_time_obj.minute, second=0, microsecond=0)
+            if days_ahead == 0 and candidate_dt <= dt_now:
+                days_ahead = 7
+            if days_ahead != 0:
+                candidate_dt += timedelta(days=days_ahead)
+            candidate_dt = candidate_dt.replace(hour=at_time_obj.hour, minute=at_time_obj.minute, second=0, microsecond=0)
+            dt_utc = PH_TZ.localize(candidate_dt).astimezone(pytz.utc)
             cur.execute(
                 "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data, entities) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (group, topic, user_id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{at_time}", entities)
@@ -508,6 +505,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 id=str(schedule_id)
             )
             await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!", parse_mode='HTML')
+
         else:
             run_at = context.user_data['run_at']
             dt_ph = PH_TZ.localize(datetime.strptime(run_at, "%Y-%m-%d %H:%M"))
