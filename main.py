@@ -542,7 +542,7 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 cur.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (row[0],))
                 conn.commit()
                 try:
-                    await update.message.reply_text("Thanks for sending your standup! 🙌 Keep up the great work!", parse_mode='HTML')
+                    await update.message.reply_text("Thanks for sending your standup!🙌", parse_mode='HTML')
                 except Exception as e:
                     logger.error(f"Failed to send thank you message: {e}")
 
