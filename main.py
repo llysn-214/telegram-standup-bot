@@ -7,9 +7,9 @@ import json
 from datetime import datetime, timedelta, time as dt_time
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity, Bot
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
+    Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, filters, ConversationHandler
 )
 from flask import Flask
@@ -155,7 +155,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                 entities = None
 
     async def send_job():
-        app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+        bot = Bot(BOT_TOKEN)
 
         # Prefer entities; if none and message looks like HTML, use parse_mode='HTML'
         send_kwargs = dict(chat_id=target_chat_id, text=message, disable_web_page_preview=False)
@@ -166,7 +166,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
         elif looks_like_html(message):
             send_kwargs["parse_mode"] = 'HTML'
 
-        msg_obj = await app_.bot.send_message(**send_kwargs)
+        msg_obj = await bot.send_message(**send_kwargs)
         logger.info(f"Sent message for schedule {schedule_id}")
 
         # Follow-ups: track @mentions for two hours (wildcard if none)
@@ -208,31 +208,32 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
     safe_enqueue_send_job(send_job)
 
 def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
-    with sqlite3.connect('schedules.db') as conn_local:
-        cur_local = conn_local.cursor()
-        # Ignore wildcard in follow-ups
-        cur_local.execute(
-            "SELECT username FROM standup_tracking "
-            "WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? "
-            "AND done=0 AND username!='*'",
-            (schedule_id, chat_id, topic_id, standup_message_id)
-        )
-        users = [row[0] for row in cur_local.fetchall()]
-        if users:
-            mention_text = " ".join([f"@{uname}" for uname in users])
-            msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
-            async def send_followup():
-                app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    async def send_follow():
+        bot = Bot(BOT_TOKEN)
+        with sqlite3.connect('schedules.db') as conn_local:
+            cur_local = conn_local.cursor()
+            # Ignore wildcard in follow-ups
+            cur_local.execute(
+                "SELECT username FROM standup_tracking "
+                "WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? "
+                "AND done=0 AND username!='*'",
+                (schedule_id, chat_id, topic_id, standup_message_id)
+            )
+            users = [row[0] for row in cur_local.fetchall()]
+            if users:
+                mention_text = " ".join([f"@{uname}" for uname in users])
+                msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
                 kwargs = dict(chat_id=chat_id, text=msg)
                 if topic_id:
                     kwargs["message_thread_id"] = int(topic_id)
-                await app_.bot.send_message(**kwargs)
-            safe_enqueue_send_job(send_followup)
-        cur_local.execute(
-            "DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?",
-            (schedule_id, chat_id, topic_id, standup_message_id)
-        )
-        conn_local.commit()
+                await bot.send_message(**kwargs)
+            cur_local.execute(
+                "DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?",
+                (schedule_id, chat_id, topic_id, standup_message_id)
+            )
+            conn_local.commit()
+
+    safe_enqueue_send_job(send_follow)
 
 # =========================
 # Rehydrate jobs on boot
@@ -332,7 +333,9 @@ async def require_dm_admin(update: Update) -> bool:
 async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_dm_admin(update): return
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title")
-    rows = cur.fetchall()
+    rows = cur.fetchall
+    if callable(rows):
+        rows = rows()
     if not rows:
         await update.message.reply_text("No groups known yet. Add me to a group and say anything there once.", parse_mode='HTML')
         return
@@ -973,7 +976,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # =========================
 def run_telegram_bot():
     global main_asyncio_loop
-    app_ = ApplicationBuilder().token(BOT_TOKEN).build()
+    app_ = Application.builder().token(BOT_TOKEN).build()
     main_asyncio_loop = asyncio.get_event_loop()
 
     conv_handler = ConversationHandler(
