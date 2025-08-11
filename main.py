@@ -409,10 +409,9 @@ async def deltopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Deleted topic mapping for group <code>{gid}</code>, topic <code>{tid}</code>.", parse_mode='HTML')
 
 async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only via DM and only admins (or everyone if ADMIN_IDS is empty)
+    # DM-only, admin-gated (or open if ADMIN_IDS empty)
     if not await require_dm_admin(update):
         return
-
     cur.execute("""
         SELECT g.chat_id, g.title, t.topic_id, t.topic_name
         FROM groups g
@@ -426,7 +425,6 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
-
     lines = []
     current_gid = None
     for gid, gtitle, tid, tname in rows:
@@ -440,7 +438,6 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             label = tname or (f"Topic #{tid}" if tid else "Main chat")
             lines.append(f"  • {html.escape(label)}  <code>{tid}</code>")
-
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 # =========================
