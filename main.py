@@ -1429,11 +1429,20 @@ async def on_app_startup(app: Application):
 # Bot setup & run
 # =========================
 def run_telegram_bot():
-    app_ = Application.builder().token(BOT_TOKEN).post_init(on_app_startup).build()
+    app_ = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .post_init(on_app_startup)  # schedules rehydrate + flood worker
+        .build()
+    )
 
-    # Conversation kept available (DM/admin only via guards)
+    # Conversation (buttons flow)
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(schedule_start, pattern="^schedule_start$")
+        ],
         states={
             CHOOSE_GROUP: [CallbackQueryHandler(choose_group, pattern="^group_")],
             CHOOSE_TOPIC: [CallbackQueryHandler(choose_topic, pattern="^topic_")],
@@ -1448,15 +1457,14 @@ def run_telegram_bot():
         allow_reentry=True,
     )
 
-    # Conversation + /start
-        app_.add_handler(conv_handler)
-        app_.add_handler(CommandHandler("start", start))
-        app_.add_handler(CommandHandler("help", help_command))          # <— add
-        app_.add_handler(CommandHandler("myschedules", myschedules))    # <— add
-        app_.add_handler(CommandHandler("whereami", whereami))          # <— add
-        app_.add_handler(CommandHandler("topicname", set_topic_name))   # <— add
-        app_.add_handler(CommandHandler("topics", topics_cmd))          # <— add
-
+    # Conversation + core DM/group commands
+    app_.add_handler(conv_handler)
+    app_.add_handler(CommandHandler("start", start))
+    app_.add_handler(CommandHandler("help", help_command))
+    app_.add_handler(CommandHandler("myschedules", myschedules))
+    app_.add_handler(CommandHandler("whereami", whereami))
+    app_.add_handler(CommandHandler("topicname", set_topic_name))
+    app_.add_handler(CommandHandler("topics", topics_cmd))
 
     # Command-only scheduling
     app_.add_handler(CommandHandler("weekly", weekly_cmd))
@@ -1476,10 +1484,10 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
     app_.add_handler(CommandHandler("health", health_cmd))
 
-    # Silent auto-registration & admin DM
+    # Silent auto-registration & admin DM on add/remove
     app_.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # Topic discovery from system events (optional)
+    # Topic discovery from system events
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, on_topic_edited))
 
@@ -1490,6 +1498,7 @@ def run_telegram_bot():
 
     logger.info("Bot running...")
     app_.run_polling()
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
