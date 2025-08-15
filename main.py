@@ -15,6 +15,7 @@ from telegram.ext import (
 from flask import Flask
 import html
 import re
+import shutil  # <-- for backup/restore
 
 # =========================
 # Config
@@ -23,7 +24,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 10000))
 PH_TZ = pytz.timezone('Asia/Manila')
 
-# Admins for DM topic management (comma-separated IDs). If empty, allow everyone.
+# Centralized DB path (change to a persistent mount if available)
+DB_PATH = os.environ.get("DB_PATH", "schedules.db")
+BACKUP_TMP_PATH = "/tmp/schedules-backup.db"
+
+# Admins for DM topic management & backups (comma-separated IDs). If empty, allow everyone.
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 def is_admin(user_id: int) -> bool:
@@ -35,7 +40,7 @@ logger = logging.getLogger(__name__)
 # =========================
 # DB init
 # =========================
-conn = sqlite3.connect('schedules.db', check_same_thread=False)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +76,16 @@ cur.execute('''CREATE TABLE IF NOT EXISTS standup_tracking (
 )''')
 conn.commit()
 
+def reopen_db():
+    """Close & reopen the global SQLite connection safely."""
+    global conn, cur
+    try:
+        conn.close()
+    except Exception:
+        pass
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+
 # =========================
 # APScheduler (PH timezone + misfire grace)
 # =========================
@@ -83,6 +98,13 @@ scheduler = BackgroundScheduler(
     }
 )
 scheduler.start()
+
+def clear_all_jobs():
+    for job in scheduler.get_jobs():
+        try:
+            scheduler.remove_job(job.id)
+        except Exception:
+            pass
 
 # =========================
 # Flask (Render/UptimeRobot ping)
@@ -143,7 +165,7 @@ def looks_like_html(s: str) -> bool:
 # =========================
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
     # Load entities fresh
-    with sqlite3.connect('schedules.db') as conn_local:
+    with sqlite3.connect(DB_PATH) as conn_local:
         cur_local = conn_local.cursor()
         cur_local.execute("SELECT entities FROM schedules WHERE id=?", (schedule_id,))
         row = cur_local.fetchone()
@@ -172,7 +194,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
         # Follow-ups: track @mentions for two hours (wildcard if none)
         usernames = set(re.findall(r'@(\w+)', message))
         deadline = (datetime.now(pytz.utc) + timedelta(hours=2)).isoformat()
-        with sqlite3.connect('schedules.db') as conn_local2:
+        with sqlite3.connect(DB_PATH) as conn_local2:
             cur_local2 = conn_local2.cursor()
             if usernames:
                 for uname in usernames:
@@ -200,7 +222,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
             )
 
         if recurrence == "none":
-            with sqlite3.connect('schedules.db') as conn_local3:
+            with sqlite3.connect(DB_PATH) as conn_local3:
                 cur_local3 = conn_local3.cursor()
                 cur_local3.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
                 conn_local3.commit()
@@ -210,7 +232,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
 def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
     async def send_follow():
         bot = Bot(BOT_TOKEN)
-        with sqlite3.connect('schedules.db') as conn_local:
+        with sqlite3.connect(DB_PATH) as conn_local:
             cur_local = conn_local.cursor()
             # Ignore wildcard in follow-ups
             cur_local.execute(
@@ -240,7 +262,7 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
 # =========================
 def rehydrate_jobs():
     try:
-        with sqlite3.connect('schedules.db') as c:
+        with sqlite3.connect(DB_PATH) as c:
             cur_r = c.cursor()
             cur_r.execute("""SELECT id, target_chat_id, topic_id, message, run_at, recurrence, recurrence_data
                              FROM schedules""")
@@ -319,17 +341,21 @@ def register_topic(chat_id, topic_id, topic_name):
         logger.error(f"Failed to register topic: {e}")
 
 # =========================
-# DM Admin topic management
+# DM Admin gating
 # =========================
 async def require_dm_admin(update: Update) -> bool:
+    # Must be in a private chat and be an admin (unless ADMIN_IDS unset)
     if not update.effective_chat or update.effective_chat.type != 'private':
         await update.message.reply_text("Please DM me to run this command.", parse_mode='HTML')
         return False
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Sorry, you’re not allowed to manage topics.", parse_mode='HTML')
+        await update.message.reply_text("Sorry, you’re not allowed to run this.", parse_mode='HTML')
         return False
     return True
 
+# =========================
+# DM Admin topic management
+# =========================
 async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_dm_admin(update): return
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title")
@@ -412,9 +438,7 @@ async def deltopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Deleted topic mapping for group <code>{gid}</code>, topic <code>{tid}</code>.", parse_mode='HTML')
 
 async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # DM-only, admin-gated (or open if ADMIN_IDS empty)
-    if not await require_dm_admin(update):
-        return
+    if not await require_dm_admin(update): return
     cur.execute("""
         SELECT g.chat_id, g.title, t.topic_id, t.topic_name
         FROM groups g
@@ -444,6 +468,52 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 # =========================
+# Backup / Restore (DM admin only)
+# =========================
+async def backupdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_dm_admin(update): return
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_user.id,  # DM to caller
+            document=open(DB_PATH, 'rb'),
+            filename='schedules.db',
+            caption='SQLite backup'
+        )
+        await update.message.reply_text("Backup sent to your DM ✅", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        await update.message.reply_text("Backup failed. Make sure you /start me in DM first.", parse_mode='HTML')
+
+async def restoredb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_dm_admin(update): return
+    # Must reply to a .db file
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text("Reply to a .db file with /restoredb.", parse_mode='HTML')
+        return
+    try:
+        file = await context.bot.get_file(update.message.reply_to_message.document.file_id)
+        await file.download_to_drive(BACKUP_TMP_PATH)
+
+        # Stop all scheduled jobs to avoid ghost jobs
+        clear_all_jobs()
+
+        # Replace DB file
+        try:
+            conn.close()
+        except Exception:
+            pass
+        shutil.copyfile(BACKUP_TMP_PATH, DB_PATH)
+
+        # Reopen DB and rehydrate jobs
+        reopen_db()
+        rehydrate_jobs()
+
+        await update.message.reply_text("Restore complete and jobs rehydrated ✅", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Restore failed: {e}")
+        await update.message.reply_text("Restore failed. Check the file and try again.", parse_mode='HTML')
+
+# =========================
 # Commands & flow
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +535,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/listtopics &lt;group_id&gt; – list topics for a specific group\n"
         "/addtopic &lt;group_id&gt; &lt;topic_id&gt; &lt;Name…&gt;\n"
         "/renametopic &lt;group_id&gt; &lt;topic_id&gt; &lt;New Name…&gt;\n"
-        "/deltopic &lt;group_id&gt; &lt;topic_id&gt;\n\n"
+        "/deltopic &lt;group_id&gt; &lt;topic_id&gt;\n"
+        "/backupdb – DM a copy of the database to you\n"
+        "/restoredb – Reply to a .db file in DM to restore\n\n"
         "Weekly schedules persist and auto-rehydrate after restarts. Timezone: Asia/Manila."
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
@@ -592,14 +664,24 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not query.data.startswith("topic_"):
+        await query.edit_message_text("Please pick a topic again using the buttons.")
+        return CHOOSE_TOPIC
     topic_id = int(query.data.split("_")[1])
     context.user_data['topic_id'] = topic_id if topic_id != 0 else None
+    return await show_recurrence_menu(update, context)
+
+async def show_recurrence_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Safe renderer for the recurrence menu (used by Back from hour picker)."""
+    query = update.callback_query
+    await query.answer()
     weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     keyboard = [[InlineKeyboardButton("One time only", callback_data="recurr_none")]] + \
                [[InlineKeyboardButton(f"Repeat every {day}", callback_data=f"recurr_weekly_{day}")] for day in weekdays]
     await query.edit_message_text(
         "Do you want this message to repeat?\n\nSelect a day to repeat weekly or pick 'One time only'.",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML'
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
     )
     return CHOOSE_RECURRENCE
 
@@ -637,7 +719,7 @@ async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     if data == "back_recurr":
-        return await choose_topic(update, context)
+        return await show_recurrence_menu(update, context)  # <-- FIX: go back safely
     _, hour_str, mode = data.split("_")  # mode: 'w' weekly, 'o' one-time
     context.user_data['picked_hour'] = hour_str
     minutes = ["00", "15", "30", "45"]
@@ -658,8 +740,10 @@ async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     at_time = f"{hour_str}:{min_str}"
     if mode == "w":
         context.user_data['recurr_time'] = at_time
-        await query.edit_message_text(f"Weekly time: <b>{at_time}</b> (Asia/Manila)\nNow, please send your message text.\nYou can use Telegram formatting & emojis.",
-                                      parse_mode='HTML')
+        await query.edit_message_text(
+            f"Weekly time: <b>{at_time}</b> (Asia/Manila)\nNow, please send your message text.\nYou can use Telegram formatting & emojis.",
+            parse_mode='HTML'
+        )
         return WRITE_MSG
     else:
         now_ph = datetime.now(PH_TZ)
@@ -667,8 +751,10 @@ async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if candidate <= now_ph:
             candidate = (now_ph + timedelta(days=1)).replace(hour=int(hour_str), minute=int(min_str), second=0, microsecond=0)
         context.user_data['run_at'] = candidate.strftime('%Y-%m-%d %H:%M')
-        await query.edit_message_text(f"Time set to: <b>{context.user_data['run_at']}</b> (Asia/Manila)\nNow, please send your message text.",
-                                      parse_mode='HTML')
+        await query.edit_message_text(
+            f"Time set to: <b>{context.user_data['run_at']}</b> (Asia/Manila)\nNow, please send your message text.",
+            parse_mode='HTML'
+        )
         return WRITE_MSG
 
 async def ask_time_one_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -873,7 +959,7 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
         username = (user.username or "").lower()
         msg_topic_id = getattr(update.message, "message_thread_id", None)
 
-        with sqlite3.connect('schedules.db') as conn_local:
+        with sqlite3.connect(DB_PATH) as conn_local:
             cur_local = conn_local.cursor()
 
             # 1) Direct reply to the bot's standup message
@@ -1012,6 +1098,8 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("deltopic", deltopic_cmd))
     app_.add_handler(CommandHandler("listtopicsdm", listtopics_dm_cmd))
     app_.add_handler(CommandHandler("mytopics", listtopics_dm_cmd))  # alias
+    app_.add_handler(CommandHandler("backupdb", backupdb_cmd))
+    app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
 
     # Status updates for forum topics (auto-discovery)
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
