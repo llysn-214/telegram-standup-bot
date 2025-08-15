@@ -35,6 +35,20 @@ def is_admin(user_id: int) -> bool:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Track app start for uptime
+APP_STARTED_AT_UTC = datetime.now(pytz.utc)
+
+def _fmt_uptime(start_utc: datetime) -> str:
+    delta = datetime.now(pytz.utc) - start_utc
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes or not parts: parts.append(f"{minutes}m")
+    return " ".join(parts)
+
 # =========================
 # DB init
 # =========================
@@ -645,29 +659,61 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT COUNT(*) FROM groups"); groups_n = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM topics"); topics_n = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM schedules"); sched_n = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM standup_tracking WHERE done=0 AND datetime(deadline) > datetime('now')")
+        open_windows = cur.fetchone()[0]
     except Exception:
-        groups_n = topics_n = sched_n = -1
+        groups_n = topics_n = sched_n = open_windows = -1
 
-    now_ph = datetime.now(PH_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    now_utc = datetime.now(pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now_ph = datetime.now(PH_TZ)
+    now_utc = datetime.now(pytz.utc)
 
     jobs = scheduler.get_jobs()
-    lines = []
+    next_lines = []
     for job in jobs[:10]:
         nrt = job.next_run_time
         if not nrt:
             continue
         ph = nrt.astimezone(PH_TZ).strftime("%Y-%m-%d %H:%M")
         utc = nrt.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"- #{job.id} @ {ph} PH ({utc} UTC)")
+
+        label = ""
+        try:
+            sid = int(job.id)
+        except Exception:
+            sid = None
+        if sid is not None:
+            try:
+                cur.execute("SELECT target_chat_id, topic_id, message, recurrence FROM schedules WHERE id=?", (sid,))
+                row = cur.fetchone()
+                if row:
+                    g, t, msg, rec = row
+                    prev = (msg or "").replace("\n", " ")
+                    if len(prev) > 40:
+                        prev = prev[:40] + "…"
+                    label = f"chat {g}, topic {t or 0}, {rec}, “{prev}”"
+            except Exception:
+                pass
+
+        next_lines.append(f"- id {job.id}: {ph} PH ({utc} UTC){(' — ' + label) if label else ''}")
+
+    try:
+        db_size = os.path.getsize(DB_PATH)
+        db_mtime = datetime.fromtimestamp(os.path.getmtime(DB_PATH), tz=PH_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        db_size = -1
+        db_mtime = "?"
+
+    qsize = send_queue.qsize() if send_queue else 0
 
     text = (
         "🩺 Health Check\n"
-        f"Now (PH): {now_ph}\n"
-        f"Now (UTC): {now_utc}\n"
+        f"Now: {now_ph.strftime('%Y-%m-%d %H:%M:%S')} PH / {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+        f"Uptime: {_fmt_uptime(APP_STARTED_AT_UTC)}\n"
         f"Groups: {groups_n} | Topics: {topics_n}\n"
-        f"Schedules: {sched_n} | APS jobs: {len(jobs)}\n"
-        "Next runs:\n" + ("\n".join(lines) if lines else "(none)")
+        f"Schedules: {sched_n} | Open standup windows: {open_windows}\n"
+        f"APScheduler jobs: {len(jobs)} | Send queue: {qsize}\n"
+        f"DB: {DB_PATH} ({db_size} bytes, mtime PH {db_mtime})\n"
+        "Next runs:\n" + ("\n".join(next_lines) if next_lines else "(none)")
     )
     await update.message.reply_text(text)
 
@@ -959,7 +1005,7 @@ async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("❌ Scheduled message cancelled.")
 
 # =========================
-# Schedule flow (buttons; regex fixed)
+# Schedule flow (buttons; now 24h + 5-minute increments)
 # =========================
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await block_if_group_non_admin(update, context, end_conv=True)
@@ -1041,7 +1087,8 @@ async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE, weekly: b
     if r: return r
     query = update.callback_query
     await query.answer()
-    hours = [f"{h:02d}" for h in range(7, 21)]
+    # 00–23 hours
+    hours = [f"{h:02d}" for h in range(0, 24)]
     keyboard, row = [], []
     for i, h in enumerate(hours, start=1):
         row.append(InlineKeyboardButton(h, callback_data=f"hour_{h}_{'w' if weekly else 'o'}"))
@@ -1060,11 +1107,20 @@ async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     if data == "back_recurr":
         return await show_recurrence_menu(update, context)
-    _, hour_str, mode = data.split("_")
+    _, hour_str, mode = data.split("_")  # mode: 'w' weekly, 'o' one-time
     context.user_data['picked_hour'] = hour_str
-    minutes = ["00", "15", "30", "45"]
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"min_{m}_{mode}") for m in minutes]]
+
+    # minutes every 5: 00..55
+    minutes = [f"{m:02d}" for m in range(0, 60, 5)]
+    keyboard, row = [], []
+    for i, m in enumerate(minutes, start=1):
+        row.append(InlineKeyboardButton(m, callback_data=f"min_{m}_{mode}"))
+        if i % 6 == 0:
+            keyboard.append(row); row = []
+    if row:
+        keyboard.append(row)
     keyboard.append([InlineKeyboardButton("Back", callback_data=f"back_hour_{mode}")])
+
     await query.edit_message_text(f"Hour: {hour_str}\nNow pick minutes:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_MIN
 
@@ -1429,13 +1485,7 @@ async def on_app_startup(app: Application):
 # Bot setup & run
 # =========================
 def run_telegram_bot():
-    app_ = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .post_init(on_app_startup)  # schedules rehydrate + flood worker
-        .build()
-    )
+    app_ = Application.builder().token(BOT_TOKEN).post_init(on_app_startup).build()
 
     # Conversation (buttons flow)
     conv_handler = ConversationHandler(
@@ -1498,7 +1548,6 @@ def run_telegram_bot():
 
     logger.info("Bot running...")
     app_.run_polling()
-
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
