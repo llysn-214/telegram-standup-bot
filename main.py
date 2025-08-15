@@ -1449,8 +1449,14 @@ def run_telegram_bot():
     )
 
     # Conversation + /start
-    app_.add_handler(conv_handler)
-    app_.add_handler(CommandHandler("start", start))
+        app_.add_handler(conv_handler)
+        app_.add_handler(CommandHandler("start", start))
+        app_.add_handler(CommandHandler("help", help_command))          # <— add
+        app_.add_handler(CommandHandler("myschedules", myschedules))    # <— add
+        app_.add_handler(CommandHandler("whereami", whereami))          # <— add
+        app_.add_handler(CommandHandler("topicname", set_topic_name))   # <— add
+        app_.add_handler(CommandHandler("topics", topics_cmd))          # <— add
+
 
     # Command-only scheduling
     app_.add_handler(CommandHandler("weekly", weekly_cmd))
