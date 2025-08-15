@@ -46,10 +46,10 @@ cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     topic_id INTEGER,
     user_id INTEGER,
     message TEXT,
-    run_at TEXT,
-    recurrence TEXT DEFAULT 'none',
-    recurrence_data TEXT,
-    entities TEXT
+    run_at TEXT,                   -- ISO UTC
+    recurrence TEXT DEFAULT 'none',-- 'none' or 'weekly'
+    recurrence_data TEXT,          -- e.g. 'Monday:11:00'
+    entities TEXT                  -- JSON saved entities
 )''')
 cur.execute('''CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
@@ -152,6 +152,50 @@ HTML_TAG_RE = re.compile(r'</?(b|strong|i|em|u|s|code|pre|a)[^>]*>', re.IGNORECA
 def looks_like_html(s: str) -> bool:
     return bool(HTML_TAG_RE.search(s))
 
+WEEKDAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+WD_ABBR = ['mon','tue','wed','thu','fri','sat','sun']
+WD_MAP = {w.lower(): w for w in WEEKDAYS}
+WD_MAP.update({w[:3].lower(): w for w in WEEKDAYS})
+
+def normalize_weekday(s: str) -> str | None:
+    if not s: return None
+    key = s.strip().lower()
+    return WD_MAP.get(key)
+
+def parse_hhmm(s: str) -> tuple[int,int] | None:
+    try:
+        t = dt_time.fromisoformat(s)
+        return t.hour, t.minute
+    except Exception:
+        try:
+            h, m = s.split(":")
+            return int(h), int(m)
+        except Exception:
+            return None
+
+def _is_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type in ('group', 'supergroup'))
+
+async def block_if_group_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, *, end_conv: bool = False):
+    """
+    If called from a group and the user is not in ADMIN_IDS, try deleting their command message (not bot messages)
+    and block the action. Returns True or ConversationHandler.END when blocked.
+    """
+    if _is_group_chat(update) and not is_admin(update.effective_user.id):
+        try:
+            # Delete only if the message was sent by the user (not the bot's menu message)
+            if update.effective_message and update.effective_message.from_user and \
+               update.effective_message.from_user.id == update.effective_user.id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=update.effective_message.message_id
+                )
+        except Exception:
+            pass
+        return ConversationHandler.END if end_conv else True
+    return False
+
 # =========================
 # Job poster
 # =========================
@@ -181,32 +225,33 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
         msg_obj = await bot.send_message(**send_kwargs)
         logger.info(f"Sent message for schedule {schedule_id}")
 
+        # Track standup replies window (2 hours)
         usernames = set(re.findall(r'@(\w+)', message))
         deadline = (datetime.now(pytz.utc) + timedelta(hours=2)).isoformat()
         with sqlite3.connect(DB_PATH) as conn_local2:
             cur_local2 = conn_local2.cursor()
-            if usernames:
-                for uname in usernames:
-                    cur_local2.execute(
-                        "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline)
-                    )
-            else:
+            # Save rows for named users (if any)
+            for uname in usernames:
                 cur_local2.execute(
                     "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (schedule_id, target_chat_id, topic_id, msg_obj.message_id, '*', deadline)
+                    (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline)
                 )
+            # Always add a wildcard row to track "someone replied"
+            cur_local2.execute(
+                "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (schedule_id, target_chat_id, topic_id, msg_obj.message_id, '*', deadline)
+            )
             conn_local2.commit()
 
-        if usernames:
-            scheduler.add_job(
-                followup_check_standups,
-                'date',
-                run_date=datetime.now(pytz.utc) + timedelta(hours=2),
-                args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
-            )
+        # Always schedule a follow-up check (even without mentions)
+        scheduler.add_job(
+            followup_check_standups,
+            'date',
+            run_date=datetime.now(pytz.utc) + timedelta(hours=2),
+            args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
+        )
 
         if recurrence == "none":
             with sqlite3.connect(DB_PATH) as conn_local3:
@@ -221,6 +266,8 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
         bot = Bot(BOT_TOKEN)
         with sqlite3.connect(DB_PATH) as conn_local:
             cur_local = conn_local.cursor()
+
+            # Pending named users (not done)
             cur_local.execute(
                 "SELECT username FROM standup_tracking "
                 "WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? "
@@ -228,13 +275,32 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
                 (schedule_id, chat_id, topic_id, standup_message_id)
             )
             users = [row[0] for row in cur_local.fetchall()]
+
+            # Did anyone reply? (wildcard marked done when any reply observed)
+            cur_local.execute(
+                "SELECT done FROM standup_tracking "
+                "WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? AND username='*' "
+                "ORDER BY id DESC LIMIT 1",
+                (schedule_id, chat_id, topic_id, standup_message_id)
+            )
+            wildcard_row = cur_local.fetchone()
+            someone_replied = bool(wildcard_row and wildcard_row[0] == 1)
+
             if users:
                 mention_text = " ".join([f"@{uname}" for uname in users])
-                msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. 🚀\n{mention_text}"
+                msg = f"⏰ Gentle reminder to send your standup when you can. {mention_text}"
                 kwargs = dict(chat_id=chat_id, text=msg)
                 if topic_id:
                     kwargs["message_thread_id"] = int(topic_id)
                 await bot.send_message(**kwargs)
+            elif not someone_replied:
+                # Nobody replied at all -> generic reminder
+                kwargs = dict(chat_id=chat_id, text="⏰ Gentle reminder: please send your standup when you can.")
+                if topic_id:
+                    kwargs["message_thread_id"] = int(topic_id)
+                await bot.send_message(**kwargs)
+
+            # Cleanup tracking rows for this standup
             cur_local.execute(
                 "DELETE FROM standup_tracking WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=?",
                 (schedule_id, chat_id, topic_id, standup_message_id)
@@ -254,9 +320,6 @@ def rehydrate_jobs():
                              FROM schedules""")
             rows = cur_r.fetchall()
 
-        weekday_abbrs = ['mon','tue','wed','thu','fri','sat','sun']
-        week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-
         for (sid, chat_id, topic_id, message, run_at, recurrence, rdata) in rows:
             job_id = str(sid)
             try:
@@ -269,7 +332,7 @@ def rehydrate_jobs():
                 weekday = parts[0] if parts else "Monday"
                 at_time = ":".join(parts[1:]) if len(parts) > 1 else "09:00"
                 hour, minute = map(int, at_time.split(":")[:2])
-                wd_abbr = weekday_abbrs[week_days.index(weekday)] if weekday in week_days else 'mon'
+                wd_abbr = WD_ABBR[WEEKDAYS.index(weekday)] if weekday in WEEKDAYS else 'mon'
                 scheduler.add_job(
                     post_scheduled_message,
                     'cron',
@@ -302,7 +365,7 @@ def rehydrate_jobs():
         logger.error(f"Failed to rehydrate jobs: {e}")
 
 # =========================
-# Conversation states
+# Conversation states (buttons still available)
 # =========================
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_TIME, CHOOSE_HOUR, CHOOSE_MIN, WRITE_MSG, CONFIRM = range(8)
 
@@ -339,17 +402,28 @@ async def require_dm_admin(update: Update) -> bool:
     return True
 
 # =========================
-# Auto-registration (no test posts)
+# Auto-registration (quiet) + DM admins group id
 # =========================
 async def on_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat and chat.type in ('group', 'supergroup'):
         register_group(chat)
+        # Optionally DM admins group_id (kept quiet if DM not started)
+        for admin_id in ADMIN_IDS or []:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"📎 Bot added to <b>{html.escape(chat.title or str(chat.id))}</b>\nGroup ID: <code>{chat.id}</code>",
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
 
 # =========================
 # DM Admin utilities
 # =========================
 async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title COLLATE NOCASE")
     rows = cur.fetchall() if hasattr(cur, "fetchall") else []
@@ -359,7 +433,26 @@ async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"- {html.escape(title)} (<code>{cid}</code>)" for cid, title in rows]
     await update.message.reply_text("Groups I know:\n" + "\n".join(lines), parse_mode='HTML')
 
+async def addgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addgroup <group_id> <Title…>", parse_mode='HTML'); return
+    try:
+        gid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("group_id must be a number.", parse_mode='HTML'); return
+    name = " ".join(context.args[1:]).strip() or str(gid)
+    try:
+        cur.execute("INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)", (gid, name))
+        conn.commit()
+        await update.message.reply_text(f"Saved group <b>{html.escape(name)}</b> (<code>{gid}</code>).", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"/addgroup failed: {e}")
+        await update.message.reply_text("Failed to save group.", parse_mode='HTML')
+
 async def listtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if not context.args:
         await update.message.reply_text("Usage: /listtopics <group_id>", parse_mode='HTML')
@@ -381,9 +474,10 @@ async def listtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Topics:\n" + "\n".join(lines), parse_mode='HTML')
 
 async def addtopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /addtopic <group_id> <topic_id> <Display Name...>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /addtopic <group_id> <topic_id> <Display Name…>", parse_mode='HTML')
         return
     try:
         gid = int(context.args[0]); tid = int(context.args[1])
@@ -394,16 +488,60 @@ async def addtopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.message.reply_text("Please provide a display name.", parse_mode='HTML')
         return
-    cur.execute("SELECT 1 FROM groups WHERE chat_id=?", (gid,))
-    if not cur.fetchone() and update.effective_chat and update.effective_chat.id == gid:
-        register_group(update.effective_chat)
+    cur.execute("INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)", (gid, str(gid)))
     register_topic(gid, tid, name)
     await update.message.reply_text(f"Saved topic <b>{html.escape(name)}</b> for group <code>{gid}</code> (topic_id <code>{tid}</code>).", parse_mode='HTML')
 
+async def bulkaddtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /bulkaddtopics <group_id> <JSON or mapping>\n"
+            "JSON example: [{\"id\":123,\"name\":\"Design\"},{\"id\":124,\"name\":\"Content\"}]\n"
+            "Mapping: 123=Design;124=Content;200=Web",
+            parse_mode='HTML'
+        ); return
+    try:
+        gid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("group_id must be a number.", parse_mode='HTML'); return
+
+    payload = " ".join(context.args[1:]).strip()
+    entries = []
+    # Try JSON
+    try:
+        data = json.loads(payload)
+        if isinstance(data, list):
+            for item in data:
+                tid = int(item.get("id"))
+                name = str(item.get("name") or f"Topic {tid}")
+                entries.append((tid, name))
+    except Exception:
+        # Try mapping: 123=Design;124=Content
+        parts = [p for p in re.split(r'[;,\n]+', payload) if p.strip()]
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                try:
+                    entries.append((int(k.strip()), v.strip()))
+                except Exception:
+                    pass
+
+    if not entries:
+        await update.message.reply_text("Could not parse topics. Provide JSON list or mapping like 123=Design;124=Content", parse_mode='HTML'); return
+
+    cur.execute("INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)", (gid, str(gid)))
+    for tid, name in entries:
+        register_topic(gid, tid, name)
+
+    await update.message.reply_text(f"Added/updated {len(entries)} topics for group <code>{gid}</code> ✅", parse_mode='HTML')
+
 async def renametopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /renametopic <group_id> <topic_id> <New Name...>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /renametopic <group_id> <topic_id> <New Name…>", parse_mode='HTML')
         return
     try:
         gid = int(context.args[0]); tid = int(context.args[1])
@@ -418,6 +556,7 @@ async def renametopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Renamed topic to <b>{html.escape(name)}</b> (group <code>{gid}</code>, topic <code>{tid}</code>).", parse_mode='HTML')
 
 async def deltopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /deltopic <group_id> <topic_id>", parse_mode='HTML')
@@ -432,6 +571,7 @@ async def deltopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Deleted topic mapping for group <code>{gid}</code>, topic <code>{tid}</code>.", parse_mode='HTML')
 
 async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     cur.execute("""
         SELECT g.chat_id, g.title, t.topic_id, t.topic_name
@@ -442,7 +582,7 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cur.fetchall()
     if not rows:
         await update.message.reply_text(
-            "No groups/topics known yet. Add me to a group as admin; I’ll auto-register silently.",
+            "No groups/topics known yet. Add me to a group or /addgroup, then /addtopic or /bulkaddtopics in DM.",
             parse_mode='HTML'
         )
         return
@@ -455,7 +595,7 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"<b>{html.escape(gtitle or str(gid))}</b>  <code>{gid}</code>")
             current_gid = gid
         if tid is None:
-            lines.append("  • (no topics discovered yet)")
+            lines.append("  • (no topics added yet)")
         else:
             label = tname or (f"Topic #{tid}" if tid else "Main chat")
             lines.append(f"  • {html.escape(label)}  <code>{tid}</code>")
@@ -465,6 +605,7 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Backup / Restore (DM admin only)
 # =========================
 async def backupdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     try:
         await context.bot.send_document(
@@ -479,6 +620,7 @@ async def backupdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Backup failed. Make sure you /start me in DM first.", parse_mode='HTML')
 
 async def restoredb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text("Reply to a .db file with /restoredb.", parse_mode='HTML')
@@ -500,30 +642,206 @@ async def restoredb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Restore failed. Check the file and try again.", parse_mode='HTML')
 
 # =========================
-# Commands & flow
+# COMMAND-ONLY SCHEDULING (DM or group for admins)
+# =========================
+async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    m = update.message
+    is_dm = (update.effective_chat.type == 'private')
+
+    try:
+        if is_dm:
+            # /weekly <group_id> <topic_id|0> <Weekday> <HH:MM> <message…>
+            if len(context.args) < 5:
+                await m.reply_text("Usage (DM): /weekly <group_id> <topic_id|0> <Weekday> <HH:MM> <message…>", parse_mode='HTML')
+                return
+            group_id = int(context.args[0])
+            topic_id = int(context.args[1]) or None
+            weekday = normalize_weekday(context.args[2])
+            hhmm = parse_hhmm(context.args[3])
+            message = " ".join(context.args[4:]).strip()
+        else:
+            # In group/topic (admin only): /weekly <Weekday> <HH:MM> <message…>
+            if len(context.args) < 3:
+                await m.reply_text("Usage: /weekly <Weekday> <HH:MM> <message…>", parse_mode='HTML')
+                return
+            group_id = update.effective_chat.id
+            topic_id = getattr(m, "message_thread_id", None)
+            weekday = normalize_weekday(context.args[0])
+            hhmm = parse_hhmm(context.args[1])
+            message = " ".join(context.args[2:]).strip()
+
+        if not weekday:
+            await m.reply_text("Invalid weekday. Example: Monday, Tue, fri", parse_mode='HTML'); return
+        if not hhmm:
+            await m.reply_text("Invalid time. Use HH:MM (24h). Example: 11:00", parse_mode='HTML'); return
+        if not message:
+            await m.reply_text("Please include the message text to send.", parse_mode='HTML'); return
+
+        hour, minute = hhmm
+        dt_now = datetime.now(PH_TZ)
+        day_idx = WEEKDAYS.index(weekday)
+        candidate_dt = dt_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        days_ahead = (day_idx - dt_now.weekday()) % 7
+        if days_ahead == 0 and candidate_dt <= dt_now:
+            days_ahead = 7
+        if days_ahead != 0:
+            candidate_dt += timedelta(days=days_ahead)
+        dt_utc = candidate_dt.astimezone(pytz.utc)
+
+        cur.execute(
+            "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data, entities) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (group_id, topic_id, m.from_user.id, message, dt_utc.isoformat(), "weekly", f"{weekday}:{hour:02d}:{minute:02d}", None)
+        )
+        conn.commit()
+        schedule_id = cur.lastrowid
+
+        scheduler.add_job(
+            post_scheduled_message,
+            'cron',
+            day_of_week=WD_ABBR[day_idx],
+            hour=hour,
+            minute=minute,
+            args=[group_id, topic_id, message, schedule_id, "weekly"],
+            id=str(schedule_id)
+        )
+
+        ack = await m.reply_text(f"✅ Weekly scheduled: every {weekday} {hour:02d}:{minute:02d} (Asia/Manila).", parse_mode='HTML')
+        if not is_dm:
+            try:
+                scheduler.add_job(
+                    lambda: asyncio.run_coroutine_threadsafe(
+                        context.bot.delete_message(chat_id=ack.chat_id, message_id=ack.message_id),
+                        main_asyncio_loop
+                    ),
+                    'date',
+                    run_date=datetime.now(pytz.utc) + timedelta(seconds=6)
+                )
+                scheduler.add_job(
+                    lambda: asyncio.run_coroutine_threadsafe(
+                        context.bot.delete_message(chat_id=m.chat_id, message_id=m.message_id),
+                        main_asyncio_loop
+                    ),
+                    'date',
+                    run_date=datetime.now(pytz.utc) + timedelta(seconds=6)
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception("weekly_cmd failed", exc_info=e)
+        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.", parse_mode='HTML')
+
+async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    m = update.message
+    is_dm = (update.effective_chat.type == 'private')
+
+    try:
+        if is_dm:
+            # /once <group_id> <topic_id|0> <YYYY-MM-DD> <HH:MM> <message…>
+            if len(context.args) < 5:
+                await m.reply_text("Usage (DM): /once <group_id> <topic_id|0> <YYYY-MM-DD> <HH:MM> <message…>", parse_mode='HTML')
+                return
+            group_id = int(context.args[0])
+            topic_id = int(context.args[1]) or None
+            date_str = context.args[2]
+            time_str = context.args[3]
+            message = " ".join(context.args[4:]).strip()
+        else:
+            # In group/topic (admin only): /once <YYYY-MM-DD> <HH:MM> <message…>
+            if len(context.args) < 3:
+                await m.reply_text("Usage: /once <YYYY-MM-DD> <HH:MM> <message…>", parse_mode='HTML')
+                return
+            group_id = update.effective_chat.id
+            topic_id = getattr(m, "message_thread_id", None)
+            date_str = context.args[0]
+            time_str = context.args[1]
+            message = " ".join(context.args[2:]).strip()
+
+        try:
+            dt_local = PH_TZ.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        except Exception:
+            await m.reply_text("Invalid date/time. Use YYYY-MM-DD HH:MM (24h).", parse_mode='HTML'); return
+        if not message:
+            await m.reply_text("Please include the message text to send.", parse_mode='HTML'); return
+
+        dt_utc = dt_local.astimezone(pytz.utc)
+        cur.execute(
+            "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, entities) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (group_id, topic_id, m.from_user.id, message, dt_utc.isoformat(), "none", None)
+        )
+        conn.commit()
+        schedule_id = cur.lastrowid
+
+        scheduler.add_job(
+            post_scheduled_message,
+            'date',
+            run_date=dt_utc,
+            args=[group_id, topic_id, message, schedule_id, "none"],
+            id=str(schedule_id)
+        )
+
+        ack = await m.reply_text("✅ One-time schedule set.", parse_mode='HTML')
+        if not is_dm:
+            try:
+                scheduler.add_job(
+                    lambda: asyncio.run_coroutine_threadsafe(
+                        context.bot.delete_message(chat_id=ack.chat_id, message_id=ack.message_id),
+                        main_asyncio_loop
+                    ),
+                    'date',
+                    run_date=datetime.now(pytz.utc) + timedelta(seconds=6)
+                )
+                scheduler.add_job(
+                    lambda: asyncio.run_coroutine_threadsafe(
+                        context.bot.delete_message(chat_id=m.chat_id, message_id=m.message_id),
+                        main_asyncio_loop
+                    ),
+                    'date',
+                    run_date=datetime.now(pytz.utc) + timedelta(seconds=6)
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception("once_cmd failed", exc_info=e)
+        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.", parse_mode='HTML')
+
+# =========================
+# Buttons flow (optional; kept)
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     keyboard = [[InlineKeyboardButton("📅 Schedule Message", callback_data="schedule_start")]]
-    await update.message.reply_text("Welcome! What do you want to do?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await update.message.reply_text(
+        "Welcome! Use /weekly and /once from DM to keep things private.\nYou can still use the button if you want.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     help_text = (
-        "<b>Available Commands:</b>\n\n"
-        "/start – Guided scheduling with buttons\n"
-        "/help – This help\n"
-        "/myschedules – List & cancel your future scheduled messages\n"
-        "/whereami – Show group & topic/thread ID\n"
-        "/topicname [Display Name] – Set a friendly name for the current topic (run inside the topic)\n"
-        "/topics – (in group) list known topics\n\n"
-        "<b>DM Admin (private chat):</b>\n"
-        "/listgroups, /listtopicsdm, /listtopics, /addtopic, /renametopic, /deltopic\n"
-        "/backupdb – DM a copy of the database\n"
-        "/restoredb – Reply to a .db file in DM to restore\n\n"
-        "Timezone: Asia/Manila. Weekly schedules persist and auto-rehydrate."
+        "<b>DM scheduling (recommended):</b>\n"
+        "/weekly &lt;group_id&gt; &lt;topic_id|0&gt; Monday 11:00 Message…\n"
+        "/once   &lt;group_id&gt; &lt;topic_id|0&gt; 2025-08-20 09:00 Message…\n\n"
+        "<b>Provision via DM (no GC noise):</b>\n"
+        "/addgroup &lt;group_id&gt; &lt;Title…&gt;\n"
+        "/addtopic &lt;group_id&gt; &lt;topic_id&gt; &lt;Name…&gt;\n"
+        "/bulkaddtopics &lt;group_id&gt; &lt;JSON or 123=Name;124=Name&gt;\n"
+        "/listgroups, /listtopics &lt;group_id&gt;, /listtopicsdm\n\n"
+        "<b>Other:</b>\n"
+        "/myschedules, /backupdb, /restoredb\n"
+        "Timezone: Asia/Manila"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
+# (Topic naming in group kept available for admins; but you can provision via DM)
 async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     if update.effective_chat.type not in ['group', 'supergroup']:
         await update.message.reply_text("Use this inside a group/topic.", parse_mode='HTML')
         return
@@ -535,11 +853,12 @@ async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.message.reply_text("Usage: /topicname Actual Topic Name", parse_mode='HTML')
         return
-    register_group(update.effective_chat)  # ensure group exists
+    register_group(update.effective_chat)
     register_topic(update.effective_chat.id, topic_id, name)
     await update.message.reply_text(f"Topic name for ID {topic_id} set to: <b>{html.escape(name)}</b>", parse_mode='HTML')
 
 async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     chat = update.effective_chat
     if chat.type not in ['group', 'supergroup']:
         await update.message.reply_text("Use this inside a group.", parse_mode='HTML')
@@ -547,7 +866,7 @@ async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id=? ORDER BY topic_id", (chat.id,))
     rows = cur.fetchall()
     if not rows:
-        await update.message.reply_text("No topics known yet. Create/rename a topic or run /topicname inside one.", parse_mode='HTML')
+        await update.message.reply_text("No topics known yet. Use /addtopic via DM to provision silently.", parse_mode='HTML')
         return
     lines = []
     for tid, tname in rows:
@@ -556,6 +875,7 @@ async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Known topics:\n" + "\n".join(lines), parse_mode='HTML')
 
 async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     user_id = update.effective_user.id
     cur.execute(
         "SELECT id, target_chat_id, topic_id, message, run_at, recurrence, recurrence_data FROM schedules WHERE user_id = ? ORDER BY run_at ASC",
@@ -594,6 +914,8 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -609,17 +931,18 @@ async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("❌ Scheduled message cancelled.", parse_mode='HTML')
 
 # =========================
-# Schedule flow
+# Schedule flow (buttons; regex fixed)
 # =========================
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title COLLATE NOCASE")
     groups = cur.fetchall()
     if not groups:
         await query.edit_message_text(
-            "No groups registered yet. Add me to a group as admin; I’ll auto-register silently on add/topic events. "
-            "You can also run /topicname inside a topic to register it.",
+            "No groups registered yet. Use /addgroup in DM or add me to a group (I’ll DM you the ID).",
             parse_mode='HTML'
         )
         return ConversationHandler.END
@@ -628,6 +951,8 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_GROUP
 
 async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     group_id = int(query.data.split("_")[1])
@@ -644,6 +969,8 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_TOPIC
 
 async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     if not query.data.startswith("topic_"):
@@ -654,9 +981,11 @@ async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await show_recurrence_menu(update, context)
 
 async def show_recurrence_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
-    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    weekdays = WEEKDAYS
     keyboard = [[InlineKeyboardButton("One time only", callback_data="recurr_none")]] + \
                [[InlineKeyboardButton(f"Repeat every {day}", callback_data=f"recurr_weekly_{day}")] for day in weekdays]
     await query.edit_message_text(
@@ -667,6 +996,8 @@ async def show_recurrence_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     return CHOOSE_RECURRENCE
 
 async def choose_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -680,6 +1011,8 @@ async def choose_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await ask_hour(update, context, weekly=True)
 
 async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE, weekly: bool):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     hours = [f"{h:02d}" for h in range(7, 21)]
@@ -694,6 +1027,8 @@ async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE, weekly: b
     return CHOOSE_HOUR
 
 async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -708,6 +1043,8 @@ async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_MIN
 
 async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -737,6 +1074,8 @@ async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WRITE_MSG
 
 async def ask_time_one_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     now = datetime.now(PH_TZ)
     presets = [
         ("In 5 min", now + timedelta(minutes=5)),
@@ -755,6 +1094,8 @@ async def ask_time_one_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSE_TIME
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = getattr(update, "callback_query", None)
     if query:
         await query.answer()
@@ -782,6 +1123,8 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return CHOOSE_TIME
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     context.user_data['message'] = update.message.text
     if update.message.entities:
         context.user_data['entities'] = json.dumps([e.to_dict() for e in update.message.entities])
@@ -809,6 +1152,8 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CONFIRM
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     query = update.callback_query
     await query.answer()
     if query.data != "confirm_yes":
@@ -827,9 +1172,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         weekday = context.user_data['weekday']
         at_time = context.user_data['recurr_time']
         dt_now = datetime.now(PH_TZ)
-        week_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-        weekday_abbrs = ['mon','tue','wed','thu','fri','sat','sun']
-        day_idx = week_days.index(weekday)
+        day_idx = WEEKDAYS.index(weekday)
 
         at_time_obj = dt_time.fromisoformat(at_time)
         candidate_dt = dt_now.replace(hour=at_time_obj.hour, minute=at_time_obj.minute, second=0, microsecond=0)
@@ -851,13 +1194,12 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scheduler.add_job(
             post_scheduled_message,
             'cron',
-            day_of_week=weekday_abbrs[day_idx],
+            day_of_week=WD_ABBR[day_idx],
             hour=int(at_time.split(":")[0]),
             minute=int(at_time.split(":")[1]),
             args=[group, topic, message, schedule_id, "weekly"],
             id=str(schedule_id)
         )
-        logger.info(f"Scheduled weekly job #{schedule_id} {weekday} {at_time} PH for chat {group} topic {topic}")
         await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!", parse_mode='HTML')
 
     else:
@@ -884,12 +1226,14 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = await block_if_group_non_admin(update, context, end_conv=True)
+    if r: return r
     await update.message.reply_text("Scheduling cancelled.", parse_mode='HTML')
     context.user_data.clear()
     return ConversationHandler.END
 
 # =========================
-# Topic discovery + Thanks (silent)
+# Topic discovery + Thanks (silent) + mark wildcard done on any reply
 # =========================
 async def on_topic_created(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -915,6 +1259,7 @@ async def on_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_topic(chat.id, topic_id, name)
 
 async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # auto-register silently
     if update.effective_chat.type in ['group', 'supergroup']:
         register_group(update.effective_chat)
         topic_id = getattr(update.message, "message_thread_id", None)
@@ -928,7 +1273,7 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
             except Exception as e:
                 logger.error(f"Topic auto-register failed: {e}")
 
-        # Standup thanks logic (silent)
+        # Standup thanks + mark replies
         user = update.effective_user
         username = (user.username or "").lower()
         msg_topic_id = getattr(update.message, "message_thread_id", None)
@@ -936,6 +1281,7 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
         with sqlite3.connect(DB_PATH) as conn_local:
             cur_local = conn_local.cursor()
 
+            # 1) Direct reply to the bot's standup message
             if getattr(update.message, "reply_to_message", None):
                 replied_id = update.message.reply_to_message.message_id
                 cur_local.execute(
@@ -947,16 +1293,23 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 )
                 rows = cur_local.fetchall()
                 matched_id = None
+                matched_user = None
                 for rid, ruser in rows:
                     if ruser == '*' or (username and ruser == username):
                         matched_id = rid
+                        matched_user = ruser
                         break
                 if matched_id:
-                    cur_local.execute("SELECT username FROM standup_tracking WHERE id=?", (matched_id,))
-                    ruser = cur_local.fetchone()[0]
-                    if ruser != '*':
-                        cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (matched_id,))
-                        conn_local.commit()
+                    # mark the matched row done
+                    cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (matched_id,))
+                    # also mark wildcard row done to indicate "someone replied"
+                    cur_local.execute(
+                        "UPDATE standup_tracking SET done=1 "
+                        "WHERE schedule_id=(SELECT schedule_id FROM standup_tracking WHERE id=?) "
+                        "AND chat_id=? AND topic_id=? AND standup_message_id=? AND username='*'",
+                        (matched_id, update.effective_chat.id, msg_topic_id, replied_id)
+                    )
+                    conn_local.commit()
                     try:
                         ack = await context.bot.send_message(chat_id=update.effective_chat.id, text="👍 Thanks for your standup!")
                         scheduler.add_job(
@@ -969,8 +1322,9 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                         )
                     except Exception as e:
                         logger.error(f"Failed to send ephemeral thanks: {e}")
-                return
+                return  # handled
 
+            # 2) Not a reply: detect posts in the same topic after the standup message and before deadline
             cur_local.execute(
                 "SELECT id, standup_message_id, username FROM standup_tracking "
                 "WHERE chat_id=? AND topic_id=? AND done=0 AND datetime(deadline) > datetime('now') "
@@ -982,7 +1336,14 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 if update.message.message_id <= standup_msg_id:
                     continue
                 if (ruser and ruser != '*' and username and username == ruser):
+                    # mark this user row done and the wildcard row done
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (rid,))
+                    cur_local.execute(
+                        "UPDATE standup_tracking SET done=1 "
+                        "WHERE schedule_id=(SELECT schedule_id FROM standup_tracking WHERE id=?) "
+                        "AND chat_id=? AND topic_id=? AND standup_message_id=? AND username='*'",
+                        (rid, update.effective_chat.id, msg_topic_id, standup_msg_id)
+                    )
                     conn_local.commit()
                     try:
                         ack = await context.bot.send_message(chat_id=update.effective_chat.id, text="👍 Thanks for your standup!")
@@ -998,6 +1359,9 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                         logger.error(f"Failed to send ephemeral thanks: {e}")
                     break
                 elif ruser == '*':
+                    # someone (anyone) posted -> mark wildcard done
+                    cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (rid,))
+                    conn_local.commit()
                     try:
                         ack = await context.bot.send_message(chat_id=update.effective_chat.id, text="👍 Thanks for your standup!")
                         scheduler.add_job(
@@ -1013,6 +1377,7 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                     break
 
 async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
     chat_id = update.effective_chat.id
     msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
     msg = f"Chat ID: <code>{chat_id}</code>"
@@ -1038,7 +1403,6 @@ async def _start_background_tasks(context):
     rehydrate_jobs()
 
 async def on_app_startup(app: Application):
-    # Schedule background startup for t=0 so it's after Application starts
     app.job_queue.run_once(_start_background_tasks, when=0)
 
 # =========================
@@ -1047,15 +1411,16 @@ async def on_app_startup(app: Application):
 def run_telegram_bot():
     app_ = Application.builder().token(BOT_TOKEN).post_init(on_app_startup).build()
 
+    # Conversation kept available (DM/admin only via guards)
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), CallbackQueryHandler(schedule_start, pattern="^schedule_start$")],
         states={
             CHOOSE_GROUP: [CallbackQueryHandler(choose_group, pattern="^group_")],
             CHOOSE_TOPIC: [CallbackQueryHandler(choose_topic, pattern="^topic_")],
             CHOOSE_RECURRENCE: [CallbackQueryHandler(choose_recurrence, pattern="^recurr_")],
-            CHOOSE_TIME: [CallbackQueryHandler(choose_time, pattern="^(time_|time_hourpick)$")],
-            CHOOSE_HOUR: [CallbackQueryHandler(choose_hour, pattern="^(hour_|back_recurr)$")],
-            CHOOSE_MIN: [CallbackQueryHandler(choose_min, pattern="^(min_|back_hour_)")],
+            CHOOSE_TIME: [CallbackQueryHandler(choose_time, pattern=r"^(time_.+|time_hourpick)$")],
+            CHOOSE_HOUR: [CallbackQueryHandler(choose_hour, pattern=r"^(hour_.+|back_recurr)$")],
+            CHOOSE_MIN: [CallbackQueryHandler(choose_min, pattern=r"^(min_.+|back_hour_.+)$")],
             WRITE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, write_msg)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")]
         },
@@ -1063,30 +1428,31 @@ def run_telegram_bot():
         allow_reentry=True,
     )
 
-    # Conversation + also a standalone /start (extra safety)
+    # Conversation + /start
     app_.add_handler(conv_handler)
     app_.add_handler(CommandHandler("start", start))
 
-    app_.add_handler(CommandHandler("help", help_command))
-    app_.add_handler(CommandHandler("myschedules", myschedules))
-    app_.add_handler(CommandHandler("whereami", whereami))
-    app_.add_handler(CommandHandler("topicname", set_topic_name))
-    app_.add_handler(CommandHandler("topics", topics_cmd))
-    app_.add_handler(CallbackQueryHandler(cancel_schedule, pattern="^cancel_"))
+    # Command-only scheduling
+    app_.add_handler(CommandHandler("weekly", weekly_cmd))
+    app_.add_handler(CommandHandler("once", once_cmd))
 
-    # DM admin commands
+    # Provision & admin (DM)
+    app_.add_handler(CommandHandler("addgroup", addgroup_cmd))
+    app_.add_handler(CommandHandler("addtopic", addtopic_cmd))
+    app_.add_handler(CommandHandler("bulkaddtopics", bulkaddtopics_cmd))
     app_.add_handler(CommandHandler("listgroups", listgroups_cmd))
     app_.add_handler(CommandHandler("listtopics", listtopics_cmd))
-    app_.add_handler(CommandHandler("addtopic", addtopic_cmd))
+    app_.add_handler(CommandHandler("listtopicsdm", listtopics_dm_cmd))
+    app_.add_handler(CommandHandler("mytopics", listtopics_dm_cmd))  # alias
     app_.add_handler(CommandHandler("renametopic", renametopic_cmd))
     app_.add_handler(CommandHandler("deltopic", deltopic_cmd))
-    app_.add_handler(CommandHandler("listtopicsdm", listtopics_dm_cmd))
-    app_.add_handler(CommandHandler("mytopics", listtopics_dm_cmd))
     app_.add_handler(CommandHandler("backupdb", backupdb_cmd))
     app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
 
-    # Silent auto-registration
+    # Silent auto-registration & admin DM
     app_.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Topic discovery from system events (optional)
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, on_topic_edited))
 
