@@ -24,11 +24,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 10000))
 PH_TZ = pytz.timezone('Asia/Manila')
 
-# Centralized DB path (swap to a persistent mount when available)
 DB_PATH = os.environ.get("DB_PATH", "schedules.db")
 BACKUP_TMP_PATH = "/tmp/schedules-backup.db"
 
-# Admins for DM topic management & backups (comma-separated IDs). If empty, allow everyone.
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 def is_admin(user_id: int) -> bool:
@@ -48,10 +46,10 @@ cur.execute('''CREATE TABLE IF NOT EXISTS schedules (
     topic_id INTEGER,
     user_id INTEGER,
     message TEXT,
-    run_at TEXT,                   -- ISO UTC
-    recurrence TEXT DEFAULT 'none',-- 'none' or 'weekly'
-    recurrence_data TEXT,          -- e.g. 'Monday:11:00'
-    entities TEXT                  -- JSON saved entities
+    run_at TEXT,
+    recurrence TEXT DEFAULT 'none',
+    recurrence_data TEXT,
+    entities TEXT
 )''')
 cur.execute('''CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
@@ -86,15 +84,11 @@ def reopen_db():
     cur = conn.cursor()
 
 # =========================
-# APScheduler (PH timezone + misfire grace)
+# APScheduler
 # =========================
 scheduler = BackgroundScheduler(
     timezone=PH_TZ,
-    job_defaults={
-        "misfire_grace_time": 3600,
-        "coalesce": True,
-        "max_instances": 1
-    }
+    job_defaults={"misfire_grace_time": 3600, "coalesce": True, "max_instances": 1}
 )
 scheduler.start()
 
@@ -106,7 +100,7 @@ def clear_all_jobs():
             pass
 
 # =========================
-# Flask (Render/UptimeRobot ping)
+# Flask (UptimeRobot ping)
 # =========================
 app_flask = Flask(__name__)
 
@@ -118,13 +112,13 @@ def run_flask():
     app_flask.run(host="0.0.0.0", port=PORT)
 
 # =========================
-# Global asyncio loop + flood control queue (FIFO)
+# Global asyncio loop + flood control queue
 # =========================
 main_asyncio_loop = None
 send_queue = asyncio.Queue()
 
 def safe_enqueue_send_job(send_job):
-    """Thread-safe: enqueue coroutine factory to be awaited by flood_control_worker."""
+    """Enqueue coroutine factory to be awaited by flood_control_worker."""
     global main_asyncio_loop
     try:
         loop = asyncio.get_running_loop()
@@ -148,19 +142,18 @@ async def flood_control_worker():
             await send_job()
         except Exception as e:
             logger.error(f"Flood control worker error: {e}")
-        await asyncio.sleep(3)  # throttle
+        await asyncio.sleep(3)
         send_queue.task_done()
 
 # =========================
 # Helpers
 # =========================
 HTML_TAG_RE = re.compile(r'</?(b|strong|i|em|u|s|code|pre|a)[^>]*>', re.IGNORECASE)
-
 def looks_like_html(s: str) -> bool:
     return bool(HTML_TAG_RE.search(s))
 
 # =========================
-# Job poster (called by APScheduler)
+# Job poster
 # =========================
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
     # Load entities fresh
@@ -177,8 +170,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
 
     async def send_job():
         bot = Bot(BOT_TOKEN)
-
-        # Prefer entities; if none and message looks like HTML, use parse_mode='HTML'
         send_kwargs = dict(chat_id=target_chat_id, text=message, disable_web_page_preview=False)
         if topic_id:
             send_kwargs["message_thread_id"] = int(topic_id)
@@ -190,7 +181,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
         msg_obj = await bot.send_message(**send_kwargs)
         logger.info(f"Sent message for schedule {schedule_id}")
 
-        # Follow-ups: track @mentions for two hours (wildcard if none)
         usernames = set(re.findall(r'@(\w+)', message))
         deadline = (datetime.now(pytz.utc) + timedelta(hours=2)).isoformat()
         with sqlite3.connect(DB_PATH) as conn_local2:
@@ -203,7 +193,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                         (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline)
                     )
             else:
-                # Single wildcard row so we can thank even without @mentions
                 cur_local2.execute(
                     "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
@@ -211,7 +200,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                 )
             conn_local2.commit()
 
-        # Only schedule follow-up ping if we have named users
         if usernames:
             scheduler.add_job(
                 followup_check_standups,
@@ -233,7 +221,6 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
         bot = Bot(BOT_TOKEN)
         with sqlite3.connect(DB_PATH) as conn_local:
             cur_local = conn_local.cursor()
-            # Ignore wildcard in follow-ups
             cur_local.execute(
                 "SELECT username FROM standup_tracking "
                 "WHERE schedule_id=? AND chat_id=? AND topic_id=? AND standup_message_id=? "
@@ -243,7 +230,7 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
             users = [row[0] for row in cur_local.fetchall()]
             if users:
                 mention_text = " ".join([f"@{uname}" for uname in users])
-                msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. We appreciate your updates! 🚀\n{mention_text}"
+                msg = f"Hey there! 🌞 Just a gentle reminder to send in your standup when you get a chance. 🚀\n{mention_text}"
                 kwargs = dict(chat_id=chat_id, text=msg)
                 if topic_id:
                     kwargs["message_thread_id"] = int(topic_id)
@@ -257,7 +244,7 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
     safe_enqueue_send_job(send_follow)
 
 # =========================
-# Rehydrate jobs on boot
+# Rehydrate jobs
 # =========================
 def rehydrate_jobs():
     try:
@@ -320,7 +307,7 @@ def rehydrate_jobs():
 CHOOSE_GROUP, CHOOSE_TOPIC, CHOOSE_RECURRENCE, CHOOSE_TIME, CHOOSE_HOUR, CHOOSE_MIN, WRITE_MSG, CONFIRM = range(8)
 
 # =========================
-# Helpers to register chats/topics
+# Group/topic registration
 # =========================
 def register_group(chat):
     try:
@@ -340,7 +327,7 @@ def register_topic(chat_id, topic_id, topic_name):
         logger.error(f"Failed to register topic: {e}")
 
 # =========================
-# DM Admin gating
+# DM admin gate
 # =========================
 async def require_dm_admin(update: Update) -> bool:
     if not update.effective_chat or update.effective_chat.type != 'private':
@@ -352,27 +339,22 @@ async def require_dm_admin(update: Update) -> bool:
     return True
 
 # =========================
-# Auto-registration without test messages
+# Auto-registration (no test posts)
 # =========================
 async def on_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires on my_chat_member updates when the bot is added/permissions change.
-    Registers the group immediately (no need to send a test message).
-    """
     chat = update.effective_chat
     if chat and chat.type in ('group', 'supergroup'):
         register_group(chat)
-        # Do NOT send any message to the group here.
 
 # =========================
-# DM Admin topic management & utilities
+# DM Admin utilities
 # =========================
 async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_dm_admin(update): return
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title COLLATE NOCASE")
     rows = cur.fetchall() if hasattr(cur, "fetchall") else []
     if not rows:
-        await update.message.reply_text("No groups known yet. Add me to a group (as admin) and set a topic name or create a topic.", parse_mode='HTML')
+        await update.message.reply_text("No groups known yet. Add me to a group as admin; I’ll auto-register silently.", parse_mode='HTML')
         return
     lines = [f"- {html.escape(title)} (<code>{cid}</code>)" for cid, title in rows]
     await update.message.reply_text("Groups I know:\n" + "\n".join(lines), parse_mode='HTML')
@@ -412,10 +394,9 @@ async def addtopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.message.reply_text("Please provide a display name.", parse_mode='HTML')
         return
-    # Ensure the group is known even if added silently
     cur.execute("SELECT 1 FROM groups WHERE chat_id=?", (gid,))
-    if not cur.fetchone():
-        register_group(update.effective_chat) if update.effective_chat.id == gid else None
+    if not cur.fetchone() and update.effective_chat and update.effective_chat.id == gid:
+        register_group(update.effective_chat)
     register_topic(gid, tid, name)
     await update.message.reply_text(f"Saved topic <b>{html.escape(name)}</b> for group <code>{gid}</code> (topic_id <code>{tid}</code>).", parse_mode='HTML')
 
@@ -535,20 +516,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/topicname [Display Name] – Set a friendly name for the current topic (run inside the topic)\n"
         "/topics – (in group) list known topics\n\n"
         "<b>DM Admin (private chat):</b>\n"
-        "/listgroups – list groups I know\n"
-        "/listtopicsdm (or /mytopics) – list all topics across all groups\n"
-        "/listtopics &lt;group_id&gt; – list topics for a specific group\n"
-        "/addtopic &lt;group_id&gt; &lt;topic_id&gt; &lt;Name…&gt;\n"
-        "/renametopic &lt;group_id&gt; &lt;topic_id&gt; &lt;New Name…&gt;\n"
-        "/deltopic &lt;group_id&gt; &lt;topic_id&gt;\n"
-        "/backupdb – DM a copy of the database to you\n"
+        "/listgroups, /listtopicsdm, /listtopics, /addtopic, /renametopic, /deltopic\n"
+        "/backupdb – DM a copy of the database\n"
         "/restoredb – Reply to a .db file in DM to restore\n\n"
-        "Weekly schedules persist and auto-rehydrate after restarts. Timezone: Asia/Manila."
+        "Timezone: Asia/Manila. Weekly schedules persist and auto-rehydrate."
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Run this inside the target topic in the group; no test messages needed.
     if update.effective_chat.type not in ['group', 'supergroup']:
         await update.message.reply_text("Use this inside a group/topic.", parse_mode='HTML')
         return
@@ -560,8 +535,7 @@ async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.message.reply_text("Usage: /topicname Actual Topic Name", parse_mode='HTML')
         return
-    # Ensure the group is recorded even if added silently
-    register_group(update.effective_chat)
+    register_group(update.effective_chat)  # ensure group exists
     register_topic(update.effective_chat.id, topic_id, name)
     await update.message.reply_text(f"Topic name for ID {topic_id} set to: <b>{html.escape(name)}</b>", parse_mode='HTML')
 
@@ -591,7 +565,6 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not schedules:
         await update.message.reply_text("You have no scheduled messages.", parse_mode='HTML')
         return
-
     for sched in schedules:
         schedule_id, chat_id, topic_id, msg, run_at, recurrence, recurrence_data = sched
         cur.execute("SELECT title FROM groups WHERE chat_id = ?", (chat_id,))
@@ -617,7 +590,6 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text += f"<b>When:</b> {dt_ph.strftime('%Y-%m-%d %H:%M')} Asia/Manila\n"
         text += f"<b>Message:</b> <code>{preview}</code>"
-
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{schedule_id}")]]
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -637,7 +609,7 @@ async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("❌ Scheduled message cancelled.", parse_mode='HTML')
 
 # =========================
-# Schedule flow (with hour/minute pickers)
+# Schedule flow
 # =========================
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -660,10 +632,8 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     group_id = int(query.data.split("_")[1])
     context.user_data['target_chat_id'] = group_id
-
     cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id = ?", (group_id,))
     topics = cur.fetchall()
-    # Ensure main chat exists in listing (if you choose to support it)
     if not any(tid == 0 for tid, _ in topics):
         topics.insert(0, (0, "Main chat"))
     keyboard = []
@@ -728,7 +698,7 @@ async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     if data == "back_recurr":
-        return await show_recurrence_menu(update, context)  # fixed back path
+        return await show_recurrence_menu(update, context)
     _, hour_str, mode = data.split("_")
     context.user_data['picked_hour'] = hour_str
     minutes = ["00", "15", "30", "45"]
@@ -919,7 +889,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # =========================
-# Auto-discover topics + Thanks (no quoting, ephemeral)
+# Topic discovery + Thanks (silent)
 # =========================
 async def on_topic_created(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -945,7 +915,6 @@ async def on_topic_edited(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_topic(chat.id, topic_id, name)
 
 async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Keep this to learn topics opportunistically; it does NOT send messages.
     if update.effective_chat.type in ['group', 'supergroup']:
         register_group(update.effective_chat)
         topic_id = getattr(update.message, "message_thread_id", None)
@@ -958,7 +927,8 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                     register_topic(update.effective_chat.id, topic_id, f"Topic #{topic_id}")
             except Exception as e:
                 logger.error(f"Topic auto-register failed: {e}")
-        # Standup thanks logic (silent unless triggered by replies/mentions)
+
+        # Standup thanks logic (silent)
         user = update.effective_user
         username = (user.username or "").lower()
         msg_topic_id = getattr(update.message, "message_thread_id", None)
@@ -1053,19 +1023,23 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='HTML')
 
 # =========================
-# Global error handler
+# Error handler
 # =========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error", exc_info=context.error)
 
 # =========================
-# PTB post-init (single place to start tasks on the running loop)
+# Start background tasks after app is running
 # =========================
-async def on_app_startup(app: Application):
+async def _start_background_tasks(context):
     global main_asyncio_loop
     main_asyncio_loop = asyncio.get_running_loop()
-    app.create_task(flood_control_worker())
+    context.application.create_task(flood_control_worker())
     rehydrate_jobs()
+
+async def on_app_startup(app: Application):
+    # Schedule background startup for t=0 so it's after Application starts
+    app.job_queue.run_once(_start_background_tasks, when=0)
 
 # =========================
 # Bot setup & run
@@ -1087,11 +1061,12 @@ def run_telegram_bot():
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         allow_reentry=True,
-        per_message=True,  # quiet the PTB warning; safe for this flow
     )
 
-    # Conversation + commands
+    # Conversation + also a standalone /start (extra safety)
     app_.add_handler(conv_handler)
+    app_.add_handler(CommandHandler("start", start))
+
     app_.add_handler(CommandHandler("help", help_command))
     app_.add_handler(CommandHandler("myschedules", myschedules))
     app_.add_handler(CommandHandler("whereami", whereami))
@@ -1106,18 +1081,16 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("renametopic", renametopic_cmd))
     app_.add_handler(CommandHandler("deltopic", deltopic_cmd))
     app_.add_handler(CommandHandler("listtopicsdm", listtopics_dm_cmd))
-    app_.add_handler(CommandHandler("mytopics", listtopics_dm_cmd))  # alias
+    app_.add_handler(CommandHandler("mytopics", listtopics_dm_cmd))
     app_.add_handler(CommandHandler("backupdb", backupdb_cmd))
     app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
 
-    # Auto-register the group when the bot is added / status changes (silent)
+    # Silent auto-registration
     app_.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
-
-    # Forum topic auto-discovery (silent)
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app_.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, on_topic_edited))
 
-    # Catch-all (learn topics opportunistically; silent)
+    # Catch-all (silent discovery & thanks)
     app_.add_handler(MessageHandler(filters.ALL, register_chat_on_message))
 
     app_.add_error_handler(error_handler)
