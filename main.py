@@ -184,7 +184,6 @@ async def block_if_group_non_admin(update: Update, context: ContextTypes.DEFAULT
     """
     if _is_group_chat(update) and not is_admin(update.effective_user.id):
         try:
-            # Delete only if the message was sent by the user (not the bot's menu message)
             if update.effective_message and update.effective_message.from_user and \
                update.effective_message.from_user.id == update.effective_user.id:
                 await context.bot.delete_message(
@@ -230,7 +229,6 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
         deadline = (datetime.now(pytz.utc) + timedelta(hours=2)).isoformat()
         with sqlite3.connect(DB_PATH) as conn_local2:
             cur_local2 = conn_local2.cursor()
-            # Save rows for named users (if any)
             for uname in usernames:
                 cur_local2.execute(
                     "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
@@ -294,7 +292,6 @@ def followup_check_standups(schedule_id, chat_id, topic_id, standup_message_id):
                     kwargs["message_thread_id"] = int(topic_id)
                 await bot.send_message(**kwargs)
             elif not someone_replied:
-                # Nobody replied at all -> generic reminder
                 kwargs = dict(chat_id=chat_id, text="⏰ Gentle reminder: please send your standup when you can.")
                 if topic_id:
                     kwargs["message_thread_id"] = int(topic_id)
@@ -394,10 +391,10 @@ def register_topic(chat_id, topic_id, topic_name):
 # =========================
 async def require_dm_admin(update: Update) -> bool:
     if not update.effective_chat or update.effective_chat.type != 'private':
-        await update.message.reply_text("Please DM me to run this command.", parse_mode='HTML')
+        await update.message.reply_text("Please DM me to run this command.")
         return False
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Sorry, you’re not allowed to run this.", parse_mode='HTML')
+        await update.message.reply_text("Sorry, you’re not allowed to run this.")
         return False
     return True
 
@@ -408,13 +405,11 @@ async def on_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat and chat.type in ('group', 'supergroup'):
         register_group(chat)
-        # Optionally DM admins group_id (kept quiet if DM not started)
         for admin_id in ADMIN_IDS or []:
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"📎 Bot added to <b>{html.escape(chat.title or str(chat.id))}</b>\nGroup ID: <code>{chat.id}</code>",
-                    parse_mode='HTML'
+                    text=f"📎 Bot added to {chat.title or chat.id}\nGroup ID: {chat.id}"
                 )
             except Exception:
                 pass
@@ -428,69 +423,69 @@ async def listgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT chat_id, title FROM groups ORDER BY title COLLATE NOCASE")
     rows = cur.fetchall() if hasattr(cur, "fetchall") else []
     if not rows:
-        await update.message.reply_text("No groups known yet. Add me to a group as admin; I’ll auto-register silently.", parse_mode='HTML')
+        await update.message.reply_text("No groups known yet. Add me to a group as admin; I’ll auto-register silently.")
         return
-    lines = [f"- {html.escape(title)} (<code>{cid}</code>)" for cid, title in rows]
-    await update.message.reply_text("Groups I know:\n" + "\n".join(lines), parse_mode='HTML')
+    lines = [f"- {title} ({cid})" for cid, title in rows]
+    await update.message.reply_text("Groups I know:\n" + "\n".join(lines))
 
 async def addgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addgroup <group_id> <Title…>", parse_mode='HTML'); return
+        await update.message.reply_text("Usage: /addgroup <group_id> <Title…>"); return
     try:
         gid = int(context.args[0])
     except Exception:
-        await update.message.reply_text("group_id must be a number.", parse_mode='HTML'); return
+        await update.message.reply_text("group_id must be a number."); return
     name = " ".join(context.args[1:]).strip() or str(gid)
     try:
         cur.execute("INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)", (gid, name))
         conn.commit()
-        await update.message.reply_text(f"Saved group <b>{html.escape(name)}</b> (<code>{gid}</code>).", parse_mode='HTML')
+        await update.message.reply_text(f"Saved group {name} ({gid}).")
     except Exception as e:
         logger.error(f"/addgroup failed: {e}")
-        await update.message.reply_text("Failed to save group.", parse_mode='HTML')
+        await update.message.reply_text("Failed to save group.")
 
 async def listtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if not context.args:
-        await update.message.reply_text("Usage: /listtopics <group_id>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /listtopics <group_id>")
         return
     try:
         gid = int(context.args[0])
     except Exception:
-        await update.message.reply_text("Invalid group_id.", parse_mode='HTML')
+        await update.message.reply_text("Invalid group_id.")
         return
     cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id=? ORDER BY topic_id", (gid,))
     rows = cur.fetchall()
     if not rows:
-        await update.message.reply_text("No topics saved for that group.", parse_mode='HTML')
+        await update.message.reply_text("No topics saved for that group.")
         return
     lines = []
     for tid, tname in rows:
         label = tname or (f"Topic #{tid}" if tid else "Main chat")
-        lines.append(f"- {html.escape(label)} (<code>{tid}</code>)")
-    await update.message.reply_text("Topics:\n" + "\n".join(lines), parse_mode='HTML')
+        lines.append(f"- {label} ({tid})")
+    await update.message.reply_text("Topics:\n" + "\n".join(lines))
 
 async def addtopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /addtopic <group_id> <topic_id> <Display Name…>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /addtopic <group_id> <topic_id> <Display Name…>")
         return
     try:
         gid = int(context.args[0]); tid = int(context.args[1])
     except Exception:
-        await update.message.reply_text("group_id and topic_id must be numbers.", parse_mode='HTML')
+        await update.message.reply_text("group_id and topic_id must be numbers.")
         return
     name = " ".join(context.args[2:]).strip()
     if not name:
-        await update.message.reply_text("Please provide a display name.", parse_mode='HTML')
+        await update.message.reply_text("Please provide a display name.")
         return
     cur.execute("INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)", (gid, str(gid)))
     register_topic(gid, tid, name)
-    await update.message.reply_text(f"Saved topic <b>{html.escape(name)}</b> for group <code>{gid}</code> (topic_id <code>{tid}</code>).", parse_mode='HTML')
+    await update.message.reply_text(f"Saved topic {name} for group {gid} (topic_id {tid}).")
 
 async def bulkaddtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
@@ -499,13 +494,12 @@ async def bulkaddtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage: /bulkaddtopics <group_id> <JSON or mapping>\n"
             "JSON example: [{\"id\":123,\"name\":\"Design\"},{\"id\":124,\"name\":\"Content\"}]\n"
-            "Mapping: 123=Design;124=Content;200=Web",
-            parse_mode='HTML'
+            "Mapping: 123=Design;124=Content;200=Web"
         ); return
     try:
         gid = int(context.args[0])
     except Exception:
-        await update.message.reply_text("group_id must be a number.", parse_mode='HTML'); return
+        await update.message.reply_text("group_id must be a number."); return
 
     payload = " ".join(context.args[1:]).strip()
     entries = []
@@ -529,46 +523,46 @@ async def bulkaddtopics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
     if not entries:
-        await update.message.reply_text("Could not parse topics. Provide JSON list or mapping like 123=Design;124=Content", parse_mode='HTML'); return
+        await update.message.reply_text("Could not parse topics. Provide JSON list or mapping like 123=Design;124=Content"); return
 
     cur.execute("INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)", (gid, str(gid)))
     for tid, name in entries:
         register_topic(gid, tid, name)
 
-    await update.message.reply_text(f"Added/updated {len(entries)} topics for group <code>{gid}</code> ✅", parse_mode='HTML')
+    await update.message.reply_text(f"Added/updated {len(entries)} topics for group {gid} ✅")
 
 async def renametopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /renametopic <group_id> <topic_id> <New Name…>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /renametopic <group_id> <topic_id> <New Name…>")
         return
     try:
         gid = int(context.args[0]); tid = int(context.args[1])
     except Exception:
-        await update.message.reply_text("group_id and topic_id must be numbers.", parse_mode='HTML')
+        await update.message.reply_text("group_id and topic_id must be numbers.")
         return
     name = " ".join(context.args[2:]).strip()
     if not name:
-        await update.message.reply_text("Please provide a new name.", parse_mode='HTML')
+        await update.message.reply_text("Please provide a new name.")
         return
     register_topic(gid, tid, name)
-    await update.message.reply_text(f"Renamed topic to <b>{html.escape(name)}</b> (group <code>{gid}</code>, topic <code>{tid}</code>).", parse_mode='HTML')
+    await update.message.reply_text(f"Renamed topic to {name} (group {gid}, topic {tid}).")
 
 async def deltopic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /deltopic <group_id> <topic_id>", parse_mode='HTML')
+        await update.message.reply_text("Usage: /deltopic <group_id> <topic_id>")
         return
     try:
         gid = int(context.args[0]); tid = int(context.args[1])
     except Exception:
-        await update.message.reply_text("group_id and topic_id must be numbers.", parse_mode='HTML')
+        await update.message.reply_text("group_id and topic_id must be numbers.")
         return
     cur.execute("DELETE FROM topics WHERE chat_id=? AND topic_id=?", (gid, tid))
     conn.commit()
-    await update.message.reply_text(f"Deleted topic mapping for group <code>{gid}</code>, topic <code>{tid}</code>.", parse_mode='HTML')
+    await update.message.reply_text(f"Deleted topic mapping for group {gid}, topic {tid}.")
 
 async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
@@ -582,8 +576,7 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cur.fetchall()
     if not rows:
         await update.message.reply_text(
-            "No groups/topics known yet. Add me to a group or /addgroup, then /addtopic or /bulkaddtopics in DM.",
-            parse_mode='HTML'
+            "No groups/topics known yet. Add me to a group or /addgroup, then /addtopic or /bulkaddtopics in DM."
         )
         return
     lines = []
@@ -592,14 +585,14 @@ async def listtopics_dm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if gid != current_gid:
             if current_gid is not None:
                 lines.append("")
-            lines.append(f"<b>{html.escape(gtitle or str(gid))}</b>  <code>{gid}</code>")
+            lines.append(f"{gtitle or gid}  ({gid})")
             current_gid = gid
         if tid is None:
             lines.append("  • (no topics added yet)")
         else:
             label = tname or (f"Topic #{tid}" if tid else "Main chat")
-            lines.append(f"  • {html.escape(label)}  <code>{tid}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+            lines.append(f"  • {label}  ({tid})")
+    await update.message.reply_text("\n".join(lines))
 
 # =========================
 # Backup / Restore (DM admin only)
@@ -614,16 +607,16 @@ async def backupdb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename='schedules.db',
             caption='SQLite backup'
         )
-        await update.message.reply_text("Backup sent to your DM ✅", parse_mode='HTML')
+        await update.message.reply_text("Backup sent to your DM ✅")
     except Exception as e:
         logger.error(f"Backup failed: {e}")
-        await update.message.reply_text("Backup failed. Make sure you /start me in DM first.", parse_mode='HTML')
+        await update.message.reply_text("Backup failed. Make sure you /start me in DM first.")
 
 async def restoredb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if not await require_dm_admin(update): return
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
-        await update.message.reply_text("Reply to a .db file with /restoredb.", parse_mode='HTML')
+        await update.message.reply_text("Reply to a .db file with /restoredb.")
         return
     try:
         file = await context.bot.get_file(update.message.reply_to_message.document.file_id)
@@ -636,10 +629,47 @@ async def restoredb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.copyfile(BACKUP_TMP_PATH, DB_PATH)
         reopen_db()
         rehydrate_jobs()
-        await update.message.reply_text("Restore complete and jobs rehydrated ✅", parse_mode='HTML')
+        await update.message.reply_text("Restore complete and jobs rehydrated ✅")
     except Exception as e:
         logger.error(f"Restore failed: {e}")
-        await update.message.reply_text("Restore failed. Check the file and try again.", parse_mode='HTML')
+        await update.message.reply_text("Restore failed. Check the file and try again.")
+
+# =========================
+# Health (DM admin only)
+# =========================
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+
+    try:
+        cur.execute("SELECT COUNT(*) FROM groups"); groups_n = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM topics"); topics_n = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM schedules"); sched_n = cur.fetchone()[0]
+    except Exception:
+        groups_n = topics_n = sched_n = -1
+
+    now_ph = datetime.now(PH_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    now_utc = datetime.now(pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    jobs = scheduler.get_jobs()
+    lines = []
+    for job in jobs[:10]:
+        nrt = job.next_run_time
+        if not nrt:
+            continue
+        ph = nrt.astimezone(PH_TZ).strftime("%Y-%m-%d %H:%M")
+        utc = nrt.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"- #{job.id} @ {ph} PH ({utc} UTC)")
+
+    text = (
+        "🩺 Health Check\n"
+        f"Now (PH): {now_ph}\n"
+        f"Now (UTC): {now_utc}\n"
+        f"Groups: {groups_n} | Topics: {topics_n}\n"
+        f"Schedules: {sched_n} | APS jobs: {len(jobs)}\n"
+        "Next runs:\n" + ("\n".join(lines) if lines else "(none)")
+    )
+    await update.message.reply_text(text)
 
 # =========================
 # COMMAND-ONLY SCHEDULING (DM or group for admins)
@@ -653,7 +683,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_dm:
             # /weekly <group_id> <topic_id|0> <Weekday> <HH:MM> <message…>
             if len(context.args) < 5:
-                await m.reply_text("Usage (DM): /weekly <group_id> <topic_id|0> <Weekday> <HH:MM> <message…>", parse_mode='HTML')
+                await m.reply_text("Usage (DM): /weekly <group_id> <topic_id|0> <Weekday> <HH:MM> <message…>")
                 return
             group_id = int(context.args[0])
             topic_id = int(context.args[1]) or None
@@ -663,7 +693,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # In group/topic (admin only): /weekly <Weekday> <HH:MM> <message…>
             if len(context.args) < 3:
-                await m.reply_text("Usage: /weekly <Weekday> <HH:MM> <message…>", parse_mode='HTML')
+                await m.reply_text("Usage: /weekly <Weekday> <HH:MM> <message…>")
                 return
             group_id = update.effective_chat.id
             topic_id = getattr(m, "message_thread_id", None)
@@ -672,11 +702,11 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = " ".join(context.args[2:]).strip()
 
         if not weekday:
-            await m.reply_text("Invalid weekday. Example: Monday, Tue, fri", parse_mode='HTML'); return
+            await m.reply_text("Invalid weekday. Example: Monday, Tue, fri"); return
         if not hhmm:
-            await m.reply_text("Invalid time. Use HH:MM (24h). Example: 11:00", parse_mode='HTML'); return
+            await m.reply_text("Invalid time. Use HH:MM (24h). Example: 11:00"); return
         if not message:
-            await m.reply_text("Please include the message text to send.", parse_mode='HTML'); return
+            await m.reply_text("Please include the message text to send."); return
 
         hour, minute = hhmm
         dt_now = datetime.now(PH_TZ)
@@ -707,7 +737,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id=str(schedule_id)
         )
 
-        ack = await m.reply_text(f"✅ Weekly scheduled: every {weekday} {hour:02d}:{minute:02d} (Asia/Manila).", parse_mode='HTML')
+        ack = await m.reply_text(f"✅ Weekly scheduled: every {weekday} {hour:02d}:{minute:02d} (Asia/Manila).")
         if not is_dm:
             try:
                 scheduler.add_job(
@@ -731,7 +761,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("weekly_cmd failed", exc_info=e)
-        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.", parse_mode='HTML')
+        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.")
 
 async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
@@ -742,7 +772,7 @@ async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_dm:
             # /once <group_id> <topic_id|0> <YYYY-MM-DD> <HH:MM> <message…>
             if len(context.args) < 5:
-                await m.reply_text("Usage (DM): /once <group_id> <topic_id|0> <YYYY-MM-DD> <HH:MM> <message…>", parse_mode='HTML')
+                await m.reply_text("Usage (DM): /once <group_id> <topic_id|0> <YYYY-MM-DD> <HH:MM> <message…>")
                 return
             group_id = int(context.args[0])
             topic_id = int(context.args[1]) or None
@@ -752,7 +782,7 @@ async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # In group/topic (admin only): /once <YYYY-MM-DD> <HH:MM> <message…>
             if len(context.args) < 3:
-                await m.reply_text("Usage: /once <YYYY-MM-DD> <HH:MM> <message…>", parse_mode='HTML')
+                await m.reply_text("Usage: /once <YYYY-MM-DD> <HH:MM> <message…>")
                 return
             group_id = update.effective_chat.id
             topic_id = getattr(m, "message_thread_id", None)
@@ -763,9 +793,9 @@ async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             dt_local = PH_TZ.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         except Exception:
-            await m.reply_text("Invalid date/time. Use YYYY-MM-DD HH:MM (24h).", parse_mode='HTML'); return
+            await m.reply_text("Invalid date/time. Use YYYY-MM-DD HH:MM (24h)."); return
         if not message:
-            await m.reply_text("Please include the message text to send.", parse_mode='HTML'); return
+            await m.reply_text("Please include the message text to send."); return
 
         dt_utc = dt_local.astimezone(pytz.utc)
         cur.execute(
@@ -784,7 +814,7 @@ async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id=str(schedule_id)
         )
 
-        ack = await m.reply_text("✅ One-time schedule set.", parse_mode='HTML')
+        ack = await m.reply_text("✅ One-time schedule set.")
         if not is_dm:
             try:
                 scheduler.add_job(
@@ -808,7 +838,7 @@ async def once_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("once_cmd failed", exc_info=e)
-        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.", parse_mode='HTML')
+        await m.reply_text("Sorry, failed to schedule. Check your arguments and try again.")
 
 # =========================
 # Buttons flow (optional; kept)
@@ -819,7 +849,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Welcome! Use /weekly and /once from DM to keep things private.\nYou can still use the button if you want.",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML'
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -834,45 +863,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/bulkaddtopics &lt;group_id&gt; &lt;JSON or 123=Name;124=Name&gt;\n"
         "/listgroups, /listtopics &lt;group_id&gt;, /listtopicsdm\n\n"
         "<b>Other:</b>\n"
-        "/myschedules, /backupdb, /restoredb\n"
+        "/myschedules, /backupdb, /restoredb, /health\n"
         "Timezone: Asia/Manila"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
-# (Topic naming in group kept available for admins; but you can provision via DM)
 async def set_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     if update.effective_chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this inside a group/topic.", parse_mode='HTML')
+        await update.message.reply_text("Use this inside a group/topic.")
         return
     topic_id = getattr(update.message, "message_thread_id", None)
     if topic_id is None:
-        await update.message.reply_text("Use this <b>inside a topic</b> (not main chat).", parse_mode='HTML')
+        await update.message.reply_text("Use this inside a topic (not main chat).")
         return
     name = " ".join(context.args).strip()
     if not name:
-        await update.message.reply_text("Usage: /topicname Actual Topic Name", parse_mode='HTML')
+        await update.message.reply_text("Usage: /topicname Actual Topic Name")
         return
     register_group(update.effective_chat)
     register_topic(update.effective_chat.id, topic_id, name)
-    await update.message.reply_text(f"Topic name for ID {topic_id} set to: <b>{html.escape(name)}</b>", parse_mode='HTML')
+    await update.message.reply_text(f"Topic name for ID {topic_id} set to: {name}")
 
 async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     chat = update.effective_chat
     if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this inside a group.", parse_mode='HTML')
+        await update.message.reply_text("Use this inside a group.")
         return
     cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id=? ORDER BY topic_id", (chat.id,))
     rows = cur.fetchall()
     if not rows:
-        await update.message.reply_text("No topics known yet. Use /addtopic via DM to provision silently.", parse_mode='HTML')
+        await update.message.reply_text("No topics known yet. Use /addtopic via DM to provision silently.")
         return
     lines = []
     for tid, tname in rows:
         display = tname or (f"Topic #{tid}" if tid else "Main chat")
-        lines.append(f"- {html.escape(display)} (<code>{tid}</code>)")
-    await update.message.reply_text("Known topics:\n" + "\n".join(lines), parse_mode='HTML')
+        lines.append(f"- {display} ({tid})")
+    await update.message.reply_text("Known topics:\n" + "\n".join(lines))
 
 async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
@@ -883,7 +911,7 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     schedules = cur.fetchall()
     if not schedules:
-        await update.message.reply_text("You have no scheduled messages.", parse_mode='HTML')
+        await update.message.reply_text("You have no scheduled messages.")
         return
     for sched in schedules:
         schedule_id, chat_id, topic_id, msg, run_at, recurrence, recurrence_data = sched
@@ -899,19 +927,19 @@ async def myschedules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dt.tzinfo is None:
             dt = pytz.utc.localize(dt)
         dt_ph = dt.astimezone(PH_TZ)
-        preview = html.escape(msg[:60].replace('\n', ' ') + ("..." if len(msg) > 60 else ""))
-        text = f"<b>Group:</b> {html.escape(group_name)}\n"
-        text += f"<b>Topic:</b> {html.escape(tname) if tname else 'Main chat'}\n"
+        preview = (msg[:60].replace('\n', ' ') + ("..." if len(msg) > 60 else ""))
+        text = f"Group: {group_name}\n"
+        text += f"Topic: {tname if tname else 'Main chat'}\n"
         if recurrence == "weekly":
             parts = (recurrence_data or "").split(":")
             weekday = parts[0]
             at_time = ":".join(parts[1:]) if len(parts) > 1 else ""
-            text += f"<b>Repeats:</b> Every {weekday} {at_time} Asia/Manila\n"
+            text += f"Repeats: Every {weekday} {at_time} Asia/Manila\n"
         else:
-            text += f"<b>When:</b> {dt_ph.strftime('%Y-%m-%d %H:%M')} Asia/Manila\n"
-        text += f"<b>Message:</b> <code>{preview}</code>"
+            text += f"When: {dt_ph.strftime('%Y-%m-%d %H:%M')} Asia/Manila\n"
+        text += f"Message: {preview}"
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{schedule_id}")]]
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await block_if_group_non_admin(update, context, end_conv=True)
@@ -928,7 +956,7 @@ async def cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     cur.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
     conn.commit()
-    await query.edit_message_text("❌ Scheduled message cancelled.", parse_mode='HTML')
+    await query.edit_message_text("❌ Scheduled message cancelled.")
 
 # =========================
 # Schedule flow (buttons; regex fixed)
@@ -942,12 +970,11 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = cur.fetchall()
     if not groups:
         await query.edit_message_text(
-            "No groups registered yet. Use /addgroup in DM or add me to a group (I’ll DM you the ID).",
-            parse_mode='HTML'
+            "No groups registered yet. Use /addgroup in DM or add me to a group (I’ll DM you the ID)."
         )
         return ConversationHandler.END
     keyboard = [[InlineKeyboardButton(f"{title}", callback_data=f"group_{chat_id}")] for chat_id, title in groups]
-    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await query.edit_message_text("Which group?", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_GROUP
 
 async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -965,7 +992,7 @@ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for topic_id, topic_name in topics:
         display = topic_name or (f"Topic #{topic_id}" if topic_id else "Main chat")
         keyboard.append([InlineKeyboardButton(display, callback_data=f"topic_{topic_id}")])
-    await query.edit_message_text("Choose a topic (or main chat):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await query.edit_message_text("Choose a topic (or main chat):", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_TOPIC
 
 async def choose_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -991,7 +1018,6 @@ async def show_recurrence_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         "Do you want this message to repeat?\n\nSelect a day to repeat weekly or pick 'One time only'.",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML'
     )
     return CHOOSE_RECURRENCE
 
@@ -1023,7 +1049,7 @@ async def ask_hour(update: Update, context: ContextTypes.DEFAULT_TYPE, weekly: b
             keyboard.append(row); row = []
     if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton("Back", callback_data="back_recurr")])
-    await query.edit_message_text("Pick <b>hour</b> (Asia/Manila):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await query.edit_message_text("Pick hour (Asia/Manila):", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_HOUR
 
 async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1039,7 +1065,7 @@ async def choose_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
     minutes = ["00", "15", "30", "45"]
     keyboard = [[InlineKeyboardButton(m, callback_data=f"min_{m}_{mode}") for m in minutes]]
     keyboard.append([InlineKeyboardButton("Back", callback_data=f"back_hour_{mode}")])
-    await query.edit_message_text(f"Hour: <b>{hour_str}</b>\nNow pick <b>minutes</b>:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await query.edit_message_text(f"Hour: {hour_str}\nNow pick minutes:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_MIN
 
 async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1057,8 +1083,7 @@ async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "w":
         context.user_data['recurr_time'] = at_time
         await query.edit_message_text(
-            f"Weekly time: <b>{at_time}</b> (Asia/Manila)\nNow, please send your message text.\nYou can use Telegram formatting & emojis.",
-            parse_mode='HTML'
+            f"Weekly time: {at_time} (Asia/Manila)\nNow, please send your message text.\nYou can use Telegram formatting & emojis."
         )
         return WRITE_MSG
     else:
@@ -1068,8 +1093,7 @@ async def choose_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
             candidate = (now_ph + timedelta(days=1)).replace(hour=int(hour_str), minute=int(min_str), second=0, microsecond=0)
         context.user_data['run_at'] = candidate.strftime('%Y-%m-%d %H:%M')
         await query.edit_message_text(
-            f"Time set to: <b>{context.user_data['run_at']}</b> (Asia/Manila)\nNow, please send your message text.",
-            parse_mode='HTML'
+            f"Time set to: {context.user_data['run_at']} (Asia/Manila)\nNow, please send your message text."
         )
         return WRITE_MSG
 
@@ -1090,7 +1114,7 @@ async def ask_time_one_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             keyboard.append([InlineKeyboardButton(label, callback_data="time_hourpick")])
     await update.callback_query.edit_message_text("Pick a time (Asia/Manila):",
-                                                  reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+                                                  reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSE_TIME
 
 async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1106,8 +1130,8 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = data.replace("time_", "")
             context.user_data['run_at'] = val
             await query.edit_message_text(
-                f"Time set to: <code>{html.escape(val)}</code> (Asia/Manila)\nNow, please send your message.\n\nYou can use Telegram's rich text formatting and emojis!",
-                parse_mode='HTML')
+                f"Time set to: {html.escape(val)} (Asia/Manila)\nNow, please send your message.\n\nYou can use Telegram's rich text formatting and emojis!"
+            )
             return WRITE_MSG
         return CHOOSE_TIME
     else:
@@ -1116,10 +1140,10 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt = datetime.strptime(txt, "%Y-%m-%d %H:%M")
             dt = PH_TZ.localize(dt)
             context.user_data['run_at'] = dt.strftime('%Y-%m-%d %H:%M')
-            await update.message.reply_text("Time set! Now, please send your message text.", parse_mode='HTML')
+            await update.message.reply_text("Time set! Now, please send your message text.")
             return WRITE_MSG
         except Exception:
-            await update.message.reply_text("Invalid format. Please use <code>YYYY-MM-DD HH:MM</code>.", parse_mode='HTML')
+            await update.message.reply_text("Invalid format. Please use YYYY-MM-DD HH:MM.")
             return CHOOSE_TIME
 
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1133,22 +1157,22 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
     recurrence = context.user_data.get('recurrence', "none")
-    msg = f"Ready to schedule:\nGroup: <code>{group}</code>\n"
+    msg = f"Ready to schedule:\nGroup: {group}\n"
     if topic:
         cur.execute("SELECT topic_name FROM topics WHERE chat_id = ? AND topic_id = ?", (group, topic))
         tname = cur.fetchone()
-        msg += f"Topic: <code>{html.escape(tname[0])}</code>\n" if tname else f"Topic ID: <code>{topic}</code>\n"
+        msg += f"Topic: {tname[0]}\n" if tname else f"Topic ID: {topic}\n"
     if recurrence == "weekly":
         weekday = context.user_data['weekday']
         at_time = context.user_data['recurr_time']
         msg += f"Repeats: Every {weekday} at {at_time} (Asia/Manila)\n"
     else:
         run_at = context.user_data.get('run_at')
-        msg += f"Time: <code>{html.escape(run_at)}</code> (Asia/Manila)\n"
-    msg += f"Message:\n<code>{html.escape(context.user_data['message'])}</code>\n\nConfirm?"
+        msg += f"Time: {run_at} (Asia/Manila)\n"
+    msg += f"Message:\n{context.user_data['message']}\n\nConfirm?"
     keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]]
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
     return CONFIRM
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1157,7 +1181,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data != "confirm_yes":
-        await query.edit_message_text("Cancelled.", parse_mode='HTML')
+        await query.edit_message_text("Cancelled.")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -1200,7 +1224,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             args=[group, topic, message, schedule_id, "weekly"],
             id=str(schedule_id)
         )
-        await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!", parse_mode='HTML')
+        await query.edit_message_text(f"✅ Weekly recurring message scheduled for every {weekday} at {at_time} (Asia/Manila)!")
 
     else:
         run_at = context.user_data['run_at']
@@ -1220,7 +1244,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             args=[group, topic, message, schedule_id, "none"],
             id=str(schedule_id)
         )
-        await query.edit_message_text("✅ One-time scheduled message set!", parse_mode='HTML')
+        await query.edit_message_text("✅ One-time scheduled message set!")
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -1228,7 +1252,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await block_if_group_non_admin(update, context, end_conv=True)
     if r: return r
-    await update.message.reply_text("Scheduling cancelled.", parse_mode='HTML')
+    await update.message.reply_text("Scheduling cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1293,16 +1317,14 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 )
                 rows = cur_local.fetchall()
                 matched_id = None
-                matched_user = None
                 for rid, ruser in rows:
                     if ruser == '*' or (username and ruser == username):
                         matched_id = rid
-                        matched_user = ruser
                         break
                 if matched_id:
                     # mark the matched row done
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (matched_id,))
-                    # also mark wildcard row done to indicate "someone replied"
+                    # also mark wildcard row done
                     cur_local.execute(
                         "UPDATE standup_tracking SET done=1 "
                         "WHERE schedule_id=(SELECT schedule_id FROM standup_tracking WHERE id=?) "
@@ -1336,7 +1358,6 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                 if update.message.message_id <= standup_msg_id:
                     continue
                 if (ruser and ruser != '*' and username and username == ruser):
-                    # mark this user row done and the wildcard row done
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (rid,))
                     cur_local.execute(
                         "UPDATE standup_tracking SET done=1 "
@@ -1359,7 +1380,6 @@ async def register_chat_on_message(update: Update, context: ContextTypes.DEFAULT
                         logger.error(f"Failed to send ephemeral thanks: {e}")
                     break
                 elif ruser == '*':
-                    # someone (anyone) posted -> mark wildcard done
                     cur_local.execute("UPDATE standup_tracking SET done=1 WHERE id=?", (rid,))
                     conn_local.commit()
                     try:
@@ -1380,12 +1400,12 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await block_if_group_non_admin(update, context): return
     chat_id = update.effective_chat.id
     msg_thread_id = update.message.message_thread_id if update.message and update.message.message_thread_id else None
-    msg = f"Chat ID: <code>{chat_id}</code>"
+    msg = f"Chat ID: {chat_id}"
     if msg_thread_id:
-        msg += f"\nTopic (Thread) ID: <code>{msg_thread_id}</code>"
+        msg += f"\nTopic (Thread) ID: {msg_thread_id}"
     else:
         msg += "\n(Not in a topic/thread right now.)"
-    await update.message.reply_text(msg, parse_mode='HTML')
+    await update.message.reply_text(msg)
 
 # =========================
 # Error handler
@@ -1448,6 +1468,7 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("deltopic", deltopic_cmd))
     app_.add_handler(CommandHandler("backupdb", backupdb_cmd))
     app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
+    app_.add_handler(CommandHandler("health", health_cmd))
 
     # Silent auto-registration & admin DM
     app_.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
