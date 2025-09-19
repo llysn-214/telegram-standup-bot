@@ -166,6 +166,63 @@ HTML_TAG_RE = re.compile(r'</?(b|strong|i|em|u|s|code|pre|a)[^>]*>', re.IGNORECA
 def looks_like_html(s: str) -> bool:
     return bool(HTML_TAG_RE.search(s))
 
+# =========================
+# Message date-line transformer & preload from env
+# =========================
+def _monday_of_week_ph(now_ph_dt: datetime) -> datetime:
+    """Return the Monday (00:00) of the week for the given PH-local datetime."""
+    monday_date = now_ph_dt.date() - timedelta(days=now_ph_dt.weekday())
+    return datetime.combine(monday_date, datetime.min.time(), tzinfo=PH_TZ)
+
+def _format_month_d_year(d: datetime) -> str:
+    return f"{d.strftime('%B')} {d.day}, {d.year}"
+
+DATE_LINE_RE = re.compile(r'(?mi)^(Date:\s*)(.+)$')
+
+def transform_message_date_line(original_text: str, now_ph_dt: datetime) -> tuple[str, bool]:
+    monday = _monday_of_week_ph(now_ph_dt)
+    replacement = _format_month_d_year(monday)
+    def _repl(m):
+        return f"{m.group(1)}{replacement}"
+    new_text, n = DATE_LINE_RE.subn(_repl, original_text or "")
+    return new_text, (n > 0)
+
+def preload_from_env_topics():
+    payload = os.environ.get("TOPIC_PRELOAD")
+    if not payload:
+        return
+    try:
+        data = json.loads(payload)
+        if not isinstance(data, list):
+            logger.error("TOPIC_PRELOAD must be a JSON array.")
+            return
+    except Exception as e:
+        logger.error(f"Failed to parse TOPIC_PRELOAD JSON: {e}")
+        return
+
+    try:
+        for entry in data:
+            try:
+                gid = int(entry.get("group_id"))
+            except Exception:
+                continue
+            title = entry.get("title") or str(gid)
+            try:
+                cur.execute("INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)", (gid, title))
+            except Exception as e:
+                logger.error(f"preload groups upsert failed: {e}")
+            for t in entry.get("topics", []) or []:
+                try:
+                    tid = int(t.get("id"))
+                    name = t.get("name") or f"Topic {tid}"
+                    register_topic(gid, tid, name)
+                except Exception as e:
+                    logger.error(f"preload topic failed: {e}")
+        conn.commit()
+        logger.info("Preloaded groups/topics from TOPIC_PRELOAD ✅")
+    except Exception as e:
+        logger.error(f"preload_from_env_topics failed: {e}")
+
 WEEKDAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 WD_ABBR = ['mon','tue','wed','thu','fri','sat','sun']
 WD_MAP = {w.lower(): w for w in WEEKDAYS}
@@ -1476,6 +1533,7 @@ async def _start_background_tasks(context):
     global main_asyncio_loop
     main_asyncio_loop = asyncio.get_running_loop()
     context.application.create_task(flood_control_worker())
+    preload_from_env_topics()
     rehydrate_jobs()
 
 async def on_app_startup(app: Application):
