@@ -281,16 +281,35 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
                 entities = [MessageEntity.de_json(e, None) for e in json.loads(row[0])]
             except Exception:
                 entities = None
+        # If the message is HTML, ignore any stored entities
+        if looks_like_html(message):
+            entities = None
 
     async def send_job():
         bot = Bot(BOT_TOKEN)
-        send_kwargs = dict(chat_id=target_chat_id, text=message, disable_web_page_preview=False)
+    
+        send_kwargs = dict(
+            chat_id=target_chat_id,
+            text=message,
+            disable_web_page_preview=False,
+        )
+    
         if topic_id:
             send_kwargs["message_thread_id"] = int(topic_id)
-        if entities:
-            send_kwargs["entities"] = entities
-        elif looks_like_html(message):
-            send_kwargs["parse_mode"] = 'HTML'
+    
+        # Fix A: message is stored as HTML, do NOT send entities
+        send_kwargs["parse_mode"] = "HTML"
+        send_kwargs.pop("entities", None)
+    
+        try:
+            msg_obj = await bot.send_message(**send_kwargs)
+        except Exception as e:
+            # Safety net: if HTML is malformed, send plain text so it still fires
+            logger.warning(f"HTML send failed for schedule {schedule_id}: {e}. Retrying as plain text.")
+            send_kwargs.pop("parse_mode", None)
+            msg_obj = await bot.send_message(**send_kwargs)
+    
+        logger.info(f"Sent message for schedule {schedule_id}")
 
         msg_obj = await bot.send_message(**send_kwargs)
         logger.info(f"Sent message for schedule {schedule_id}")
@@ -1262,11 +1281,14 @@ async def choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await block_if_group_non_admin(update, context, end_conv=True)
     if r: return r
-    context.user_data['message'] = update.message.text
-    if update.message.entities:
-        context.user_data['entities'] = json.dumps([e.to_dict() for e in update.message.entities])
-    else:
-        context.user_data['entities'] = None
+    # Store HTML version to avoid entity/UTF-16 offset issues on send
+    context.user_data['message'] = update.message.text_html or html.escape(update.message.text or "")
+    
+    # Keep a plain-text preview for the confirmation screen
+    context.user_data['message_preview'] = update.message.text or ""
+    
+    # We no longer store entities
+    context.user_data['entities'] = None
     group = context.user_data.get('target_chat_id')
     topic = context.user_data.get('topic_id')
     recurrence = context.user_data.get('recurrence', "none")
@@ -1282,7 +1304,7 @@ async def write_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         run_at = context.user_data.get('run_at')
         msg += f"Time: {run_at} (Asia/Manila)\n"
-    msg += f"Message:\n{context.user_data['message']}\n\nConfirm?"
+    msg += f"Message:\n{context.user_data.get('message_preview','')}\n\nConfirm?"
     keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="confirm_yes")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="confirm_no")]]
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
