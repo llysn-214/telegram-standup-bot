@@ -174,18 +174,33 @@ def _monday_of_week_ph(now_ph_dt: datetime) -> datetime:
     monday_date = now_ph_dt.date() - timedelta(days=now_ph_dt.weekday())
     return datetime.combine(monday_date, datetime.min.time(), tzinfo=PH_TZ)
 
+def _standup_monday_ph(now_ph_dt: datetime) -> datetime:
+    """Return today's Monday if Monday, otherwise the upcoming Monday."""
+    days_ahead = (0 - now_ph_dt.weekday()) % 7
+    monday_date = now_ph_dt.date() + timedelta(days=days_ahead)
+    return datetime.combine(monday_date, datetime.min.time(), tzinfo=PH_TZ)
+
 def _format_month_d_year(d: datetime) -> str:
     return f"{d.strftime('%B')} {d.day}, {d.year}"
 
 DATE_LINE_RE = re.compile(r'(?mi)^(Date:\s*)(.+)$')
 
 def transform_message_date_line(original_text: str, now_ph_dt: datetime) -> tuple[str, bool]:
-    monday = _monday_of_week_ph(now_ph_dt)
+    monday = _standup_monday_ph(now_ph_dt)
     replacement = _format_month_d_year(monday)
     def _repl(m):
         return f"{m.group(1)}{replacement}"
     new_text, n = DATE_LINE_RE.subn(_repl, original_text or "")
     return new_text, (n > 0)
+
+def render_scheduled_message(original_text: str, now_ph_dt: datetime | None = None) -> str:
+    """Apply send-time substitutions while keeping DB templates stable."""
+    now_ph_dt = now_ph_dt or datetime.now(PH_TZ)
+    rendered, changed = transform_message_date_line(original_text or "", now_ph_dt)
+    if changed:
+        return rendered
+    monday = _standup_monday_ph(now_ph_dt)
+    return (original_text or "").replace("{{date}}", _format_month_d_year(monday))
 
 def preload_from_env_topics():
     payload = os.environ.get("TOPIC_PRELOAD")
@@ -244,6 +259,326 @@ def parse_hhmm(s: str) -> tuple[int,int] | None:
         except Exception:
             return None
 
+STANDUP_WEEKDAY = "Monday"
+STANDUP_GENERAL_TIME = "09:55"
+STANDUP_TOPIC_TIME = "10:00"
+
+STANDUP_GENERAL_MESSAGE = """Hello team!
+
+Date: July 6, 2026
+
+Please reply under your team's topic.
+
+🗓 Priorities
+What are your top 3 priorities this week?
+
+🚀 Deliverables
+What will be completed, launched, submitted, or moved forward by Friday?
+
+🤝 Support Needed
+What approvals, decisions, or help do you need?
+
+🚧 Risks & Blockers
+What's at risk of slipping, and why?"""
+
+STANDUP_VERTICALS = [
+    {
+        "title": "🎥 Influence",
+        "topic_names": ["Influence"],
+        "tags": "@dima_influence @sofia_influence @julie_ph_influence",
+        "body": """🗓 Priorities
+Which influencers, campaigns, or negotiations are you actively driving this week?
+
+🚀 Deliverables
+Signed deals, content approvals, posts going live, campaign launches, or onboarding.
+
+🤝 Support Needed
+Approvals, budgets, assets, contracts, or coordination.
+
+🚧 Risks & Blockers
+What's preventing campaigns from moving?""",
+    },
+    {
+        "title": "🤝 Affiliates & Agents",
+        "topic_names": ["Aff&Agents", "Affiliates & Agents"],
+        "tags": "@raz_marketing @brian_ph_aff @nina_ph_aff @ty_aff",
+        "body": """🗓 Priorities
+Which affiliates, agents, or recruitment efforts are your focus this week?
+
+🚀 Deliverables
+New signings, onboarding, applications, payouts, reports, or optimizations.
+
+🤝 Support Needed
+Approvals, tracking, creatives, payouts, or technical support.
+
+🚧 Risks & Blockers
+What's slowing growth or partner activation?""",
+    },
+    {
+        "title": "📈 Marketing",
+        "topic_names": ["Marketing"],
+        "tags": "@angelica_ph_marketing @mari_ph_marketing @toby_vn_marketing",
+        "body": """🗓 Priorities
+Which campaigns or growth initiatives are you executing this week?
+
+🚀 Deliverables
+Campaign launches, optimizations, reports, creatives, or experiments.
+
+🤝 Support Needed
+Budget, assets, approvals, or cross-team coordination.
+
+🚧 Risks & Blockers
+What's delaying execution or affecting performance?""",
+    },
+    {
+        "title": "📱 Social",
+        "topic_names": ["Social"],
+        "tags": "@spuddy_ph_smm",
+        "body": """🗓 Priorities
+What content, campaigns, or platform initiatives are your focus this week?
+
+🚀 Deliverables
+Content published, calendars completed, reports, or major posts.
+
+🤝 Support Needed
+Assets, copy approval, or coordination.
+
+🚧 Risks & Blockers
+What's preventing content from going live?""",
+    },
+    {
+        "title": "💬 Community",
+        "topic_names": ["Community"],
+        "tags": "@Cymon_PH_CommunityTL @raz_marketing @brian_ph_aff",
+        "body": """🗓 Priorities
+Which community initiatives, events, or engagement activities are you driving this week?
+
+🚀 Deliverables
+Events, activations, reports, feedback summaries, or community improvements.
+
+🤝 Support Needed
+Approvals, content, moderation support, or coordination.
+
+🚧 Risks & Blockers
+What's impacting community growth or engagement?""",
+    },
+    {
+        "title": "🎨 Creatives",
+        "topic_names": ["Creatives"],
+        "tags": "@santi_ph_creatives @jom_ph_creatives",
+        "body": """🗓 Priorities
+Which creative requests are your priority this week?
+
+🚀 Deliverables
+Final assets, revisions, videos, copy, or production work.
+
+🤝 Support Needed
+Briefs, approvals, feedback, or references.
+
+🚧 Risks & Blockers
+What's delaying delivery?""",
+    },
+    {
+        "title": "🤝 Partnerships",
+        "topic_names": ["Partnerships"],
+        "tags": "@frederich_ph_partnerships @angelica_ph_marketing",
+        "body": """🗓 Priorities
+Which partner opportunities or negotiations are you advancing this week?
+
+🚀 Deliverables
+Proposals, agreements, sponsorships, or partnership launches.
+
+🤝 Support Needed
+Approvals, pricing, legal, or materials.
+
+🚧 Risks & Blockers
+What's holding partner discussions or launches back?""",
+    },
+    {
+        "title": "📋 Projects",
+        "topic_names": ["Projects"],
+        "tags": "@leo_ph_projects",
+        "body": """🗓 Priorities
+Which projects or workstreams are your main focus this week?
+
+🚀 Deliverables
+Milestones, launches, handoffs, or completed tasks.
+
+🤝 Support Needed
+Approvals, decisions, or dependency resolution.
+
+🚧 Risks & Blockers
+What's putting timelines at risk?""",
+    },
+]
+
+def _standup_topic_message(vertical: dict) -> str:
+    return (
+        f"Hello {vertical['tags']}!\n\n"
+        "Date: July 6, 2026\n\n"
+        f"{vertical['title']}\n\n"
+        f"{vertical['body']}\n\n"
+        "---\n\n"
+        "⚠️ Please reply to this message so I can tag this as submitted, thanks!"
+    )
+
+def _next_weekly_run_utc(weekday: str, hhmm: str) -> datetime:
+    hour, minute = parse_hhmm(hhmm)
+    now_ph = datetime.now(PH_TZ)
+    day_idx = WEEKDAYS.index(weekday)
+    candidate_dt = now_ph.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    days_ahead = (day_idx - now_ph.weekday()) % 7
+    if days_ahead == 0 and candidate_dt <= now_ph:
+        days_ahead = 7
+    if days_ahead:
+        candidate_dt += timedelta(days=days_ahead)
+    return candidate_dt.astimezone(pytz.utc)
+
+def _resolve_standup_chat_id(explicit_chat_id: int | None = None) -> int | None:
+    if explicit_chat_id:
+        return explicit_chat_id
+    env_chat_id = os.environ.get("STANDUP_CHAT_ID")
+    if env_chat_id and env_chat_id.strip().lstrip("-").isdigit():
+        return int(env_chat_id)
+    cur.execute("SELECT chat_id FROM groups ORDER BY title COLLATE NOCASE LIMIT 1")
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+def _topic_lookup(chat_id: int) -> dict[str, int]:
+    cur.execute("SELECT topic_id, topic_name FROM topics WHERE chat_id=?", (chat_id,))
+    return {(name or "").strip().lower(): int(tid) for tid, name in cur.fetchall()}
+
+def _resolve_vertical_topic_id(vertical: dict, lookup: dict[str, int]) -> int | None:
+    for name in vertical["topic_names"]:
+        topic_id = lookup.get(name.strip().lower())
+        if topic_id is not None:
+            return topic_id
+    return None
+
+def _split_long_message(text: str, limit: int = 3900) -> list[str]:
+    chunks = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+def _standup_targets(chat_id: int) -> tuple[list[dict], list[str]]:
+    lookup = _topic_lookup(chat_id)
+    missing = []
+    targets = [
+        {
+            "label": "General",
+            "topic_id": None,
+            "hhmm": STANDUP_GENERAL_TIME,
+            "message": STANDUP_GENERAL_MESSAGE,
+        }
+    ]
+    for vertical in STANDUP_VERTICALS:
+        topic_id = _resolve_vertical_topic_id(vertical, lookup)
+        if topic_id is None:
+            missing.append(", ".join(vertical["topic_names"]))
+            continue
+        targets.append(
+            {
+                "label": vertical["title"],
+                "topic_id": topic_id,
+                "hhmm": STANDUP_TOPIC_TIME,
+                "message": _standup_topic_message(vertical),
+            }
+        )
+    return targets, missing
+
+def _replace_standup_schedule(target: dict, chat_id: int, user_id: int) -> dict:
+    topic_id = target["topic_id"]
+    hhmm = target["hhmm"]
+    recurrence_data = f"{STANDUP_WEEKDAY}:{hhmm}"
+
+    if topic_id is None:
+        cur.execute(
+            """SELECT id FROM schedules
+               WHERE target_chat_id=? AND topic_id IS NULL
+               AND recurrence='weekly' AND recurrence_data=?""",
+            (chat_id, recurrence_data)
+        )
+    else:
+        cur.execute(
+            """SELECT id FROM schedules
+               WHERE target_chat_id=? AND topic_id=?
+               AND recurrence='weekly' AND recurrence_data=?""",
+            (chat_id, topic_id, recurrence_data)
+        )
+    old_ids = [str(row[0]) for row in cur.fetchall()]
+    for old_id in old_ids:
+        try:
+            scheduler.remove_job(old_id)
+        except Exception:
+            pass
+
+    if topic_id is None:
+        cur.execute(
+            """DELETE FROM schedules
+               WHERE target_chat_id=? AND topic_id IS NULL
+               AND recurrence='weekly' AND recurrence_data=?""",
+            (chat_id, recurrence_data)
+        )
+    else:
+        cur.execute(
+            """DELETE FROM schedules
+               WHERE target_chat_id=? AND topic_id=?
+               AND recurrence='weekly' AND recurrence_data=?""",
+            (chat_id, topic_id, recurrence_data)
+        )
+
+    run_at_utc = _next_weekly_run_utc(STANDUP_WEEKDAY, hhmm)
+    cur.execute(
+        "INSERT INTO schedules (target_chat_id, topic_id, user_id, message, run_at, recurrence, recurrence_data, entities) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            chat_id,
+            topic_id,
+            user_id,
+            target["message"],
+            run_at_utc.isoformat(),
+            "weekly",
+            recurrence_data,
+            None,
+        )
+    )
+    schedule_id = cur.lastrowid
+    hour, minute = parse_hhmm(hhmm)
+    scheduler.add_job(
+        post_scheduled_message,
+        'cron',
+        day_of_week=WD_ABBR[WEEKDAYS.index(STANDUP_WEEKDAY)],
+        hour=hour,
+        minute=minute,
+        args=[chat_id, topic_id, target["message"], schedule_id, "weekly"],
+        id=str(schedule_id),
+        replace_existing=True
+    )
+    return {**target, "schedule_id": schedule_id}
+
+def _seed_standup_schedules(chat_id: int, user_id: int) -> tuple[list[dict], list[str]]:
+    targets, missing = _standup_targets(chat_id)
+    seeded = [_replace_standup_schedule(target, chat_id, user_id) for target in targets]
+    conn.commit()
+    return seeded, missing
+
+def _parse_optional_chat_id_arg(args: list[str]) -> tuple[int | None, list[str]]:
+    remaining = list(args or [])
+    explicit_chat_id = None
+    if remaining and remaining[0].lstrip("-").isdigit():
+        explicit_chat_id = int(remaining.pop(0))
+    return explicit_chat_id, remaining
+
 def _is_group_chat(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type in ('group', 'supergroup'))
@@ -270,6 +605,8 @@ async def block_if_group_non_admin(update: Update, context: ContextTypes.DEFAULT
 # Job poster
 # =========================
 def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recurrence="none"):
+    rendered_message = render_scheduled_message(message)
+
     # Load entities fresh
     with sqlite3.connect(DB_PATH) as conn_local:
         cur_local = conn_local.cursor()
@@ -282,7 +619,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
             except Exception:
                 entities = None
         # If the message is HTML, ignore any stored entities
-        if looks_like_html(message):
+        if looks_like_html(rendered_message):
             entities = None
 
     async def send_job():
@@ -290,7 +627,7 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
     
         send_kwargs = dict(
             chat_id=target_chat_id,
-            text=message,
+            text=rendered_message,
             disable_web_page_preview=False,
         )
     
@@ -311,35 +648,33 @@ def post_scheduled_message(target_chat_id, topic_id, message, schedule_id, recur
     
         logger.info(f"Sent message for schedule {schedule_id}")
 
-        msg_obj = await bot.send_message(**send_kwargs)
-        logger.info(f"Sent message for schedule {schedule_id}")
-
         # Track standup replies window (2 hours)
-        usernames = set(re.findall(r'@(\w+)', message))
+        usernames = set(re.findall(r'@(\w+)', rendered_message))
         deadline = (datetime.now(pytz.utc) + timedelta(hours=2)).isoformat()
-        with sqlite3.connect(DB_PATH) as conn_local2:
-            cur_local2 = conn_local2.cursor()
-            for uname in usernames:
+        if usernames:
+            with sqlite3.connect(DB_PATH) as conn_local2:
+                cur_local2 = conn_local2.cursor()
+                for uname in usernames:
+                    cur_local2.execute(
+                        "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline)
+                    )
+                # Always add a wildcard row to track "someone replied"
                 cur_local2.execute(
                     "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (schedule_id, target_chat_id, topic_id, msg_obj.message_id, uname.lower(), deadline)
+                    (schedule_id, target_chat_id, topic_id, msg_obj.message_id, '*', deadline)
                 )
-            # Always add a wildcard row to track "someone replied"
-            cur_local2.execute(
-                "INSERT INTO standup_tracking (schedule_id, chat_id, topic_id, standup_message_id, username, deadline) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (schedule_id, target_chat_id, topic_id, msg_obj.message_id, '*', deadline)
-            )
-            conn_local2.commit()
+                conn_local2.commit()
 
-        # Always schedule a follow-up check (even without mentions)
-        scheduler.add_job(
-            followup_check_standups,
-            'date',
-            run_date=datetime.now(pytz.utc) + timedelta(hours=2),
-            args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
-        )
+            # Only tagged topic messages need follow-up checks.
+            scheduler.add_job(
+                followup_check_standups,
+                'date',
+                run_date=datetime.now(pytz.utc) + timedelta(hours=2),
+                args=[schedule_id, target_chat_id, topic_id, msg_obj.message_id]
+            )
 
         if recurrence == "none":
             with sqlite3.connect(DB_PATH) as conn_local3:
@@ -792,6 +1127,172 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Next runs:\n" + ("\n".join(next_lines) if next_lines else "(none)")
     )
     await update.message.reply_text(text)
+
+# =========================
+# Standup template seeding
+# =========================
+async def seedstandups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+
+    explicit_chat_id, remaining = _parse_optional_chat_id_arg(context.args)
+    if remaining:
+        await update.message.reply_text("Usage: /seedstandups [group_id]")
+        return
+
+    chat_id = _resolve_standup_chat_id(explicit_chat_id)
+    if chat_id is None:
+        await update.message.reply_text("No standup group found. Use /addgroup first, or set STANDUP_CHAT_ID.")
+        return
+
+    try:
+        seeded, missing = _seed_standup_schedules(chat_id, update.effective_user.id)
+        lines = [f"Seeded {len(seeded)} weekly standup schedules for chat {chat_id}:"]
+        lines.extend([
+            f"- {item['label']}: {STANDUP_WEEKDAY} {item['hhmm']} PH, topic {item['topic_id'] or 0}"
+            for item in seeded
+        ])
+        if missing:
+            lines.append("")
+            lines.append("Missing topic mappings:")
+            lines.extend([f"- {name}" for name in missing])
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception("seedstandups_cmd failed", exc_info=e)
+        await update.message.reply_text("Failed to seed standups. Check logs and topic mappings.")
+
+async def previewstandups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+
+    explicit_chat_id = None
+    if context.args:
+        try:
+            explicit_chat_id = int(context.args[0])
+        except Exception:
+            await update.message.reply_text("Usage: /previewstandups [group_id]")
+            return
+
+    chat_id = _resolve_standup_chat_id(explicit_chat_id)
+    lookup = _topic_lookup(chat_id) if chat_id is not None else {}
+
+    messages = ["GENERAL\n\n" + render_scheduled_message(STANDUP_GENERAL_MESSAGE)]
+    for vertical in STANDUP_VERTICALS:
+        topic_id = _resolve_vertical_topic_id(vertical, lookup)
+        label = f"{vertical['title']} (topic {topic_id if topic_id is not None else 'missing'})"
+        messages.append(label + "\n\n" + render_scheduled_message(_standup_topic_message(vertical)))
+
+    preview = "\n\n====================\n\n".join(messages)
+    for chunk in _split_long_message(preview):
+        await update.message.reply_text(chunk)
+
+async def standuphelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+
+    text = (
+        "Standup Bot Commands\n\n"
+        "/previewstandups [group_id]\n"
+        "Preview the General and per-topic standup messages in DM without sending to the group.\n\n"
+        "/seedstandups [group_id]\n"
+        "Create or refresh the weekly Monday schedules: General at 09:55 PH and topic prompts at 10:00 PH.\n\n"
+        "/recoverstandups [group_id] [dryrun] [force]\n"
+        "Recover after a Render restart or missed Monday send. Use dryrun to see what would happen. Use force to send General and all mapped topic prompts immediately.\n\n"
+        "/health\n"
+        "Show uptime, DB status, active schedules, and next run times.\n\n"
+        "/listgroups\n"
+        "Show groups the bot knows.\n\n"
+        "/listtopics <group_id>\n"
+        "Show saved topic mappings for a group.\n\n"
+        "/addgroup <group_id> <title>\n"
+        "Manually save a group.\n\n"
+        "/addtopic <group_id> <topic_id> <name>\n"
+        "Manually save a topic mapping.\n\n"
+        "Typical flow after deploy/redeploy:\n"
+        "1. /standuphelp\n"
+        "2. /previewstandups\n"
+        "3. /recoverstandups dryrun\n"
+        "4. /seedstandups"
+    )
+    await update.message.reply_text(text)
+
+async def recoverstandups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await block_if_group_non_admin(update, context): return
+    if not await require_dm_admin(update): return
+
+    explicit_chat_id, options = _parse_optional_chat_id_arg(context.args)
+    option_set = {opt.lower() for opt in options}
+    allowed_options = {"dryrun", "force"}
+    invalid_options = option_set - allowed_options
+    if invalid_options:
+        await update.message.reply_text("Usage: /recoverstandups [group_id] [dryrun] [force]")
+        return
+
+    chat_id = _resolve_standup_chat_id(explicit_chat_id)
+    if chat_id is None:
+        await update.message.reply_text("No standup group found. Use /addgroup first, or set STANDUP_CHAT_ID.")
+        return
+
+    dryrun = "dryrun" in option_set
+    force = "force" in option_set
+    now_ph = datetime.now(PH_TZ)
+    general_cutoff = dt_time.fromisoformat(STANDUP_GENERAL_TIME)
+    topic_cutoff = dt_time.fromisoformat(STANDUP_TOPIC_TIME)
+
+    try:
+        seeded, missing = _seed_standup_schedules(chat_id, update.effective_user.id)
+        due = []
+        reason = ""
+
+        if force:
+            due = seeded
+            reason = "force option: sending all standup messages now"
+        elif now_ph.weekday() != WEEKDAYS.index(STANDUP_WEEKDAY):
+            reason = f"today is {WEEKDAYS[now_ph.weekday()]}; schedules refreshed for next {STANDUP_WEEKDAY}"
+        elif now_ph.time() < general_cutoff:
+            reason = f"before {STANDUP_GENERAL_TIME} PH; schedules refreshed and will fire normally"
+        elif now_ph.time() < topic_cutoff:
+            due = [item for item in seeded if item["topic_id"] is None]
+            reason = f"between {STANDUP_GENERAL_TIME} and {STANDUP_TOPIC_TIME} PH; catching up General only"
+        else:
+            due = seeded
+            reason = f"after {STANDUP_TOPIC_TIME} PH; catching up General and all topic prompts now"
+
+        if not dryrun:
+            for item in due:
+                post_scheduled_message(
+                    chat_id,
+                    item["topic_id"],
+                    item["message"],
+                    item["schedule_id"],
+                    "weekly"
+                )
+
+        lines = [
+            f"Recovery checked at {now_ph.strftime('%Y-%m-%d %H:%M')} PH.",
+            f"Mode: {'dry run' if dryrun else 'live'}",
+            f"Result: {reason}.",
+            f"Seeded/refreshed schedules: {len(seeded)}",
+        ]
+        if due:
+            lines.append("")
+            lines.append("Messages " + ("that would send now:" if dryrun else "queued to send now:"))
+            lines.extend([
+                f"- {item['label']} -> topic {item['topic_id'] or 0}"
+                for item in due
+            ])
+        else:
+            lines.append("")
+            lines.append("No immediate messages needed.")
+        if missing:
+            lines.append("")
+            lines.append("Missing topic mappings:")
+            lines.extend([f"- {name}" for name in missing])
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception("recoverstandups_cmd failed", exc_info=e)
+        await update.message.reply_text("Failed to recover standups. Check logs and topic mappings.")
 
 # =========================
 # COMMAND-ONLY SCHEDULING (DM or group for admins)
@@ -1613,6 +2114,10 @@ def run_telegram_bot():
     app_.add_handler(CommandHandler("backupdb", backupdb_cmd))
     app_.add_handler(CommandHandler("restoredb", restoredb_cmd))
     app_.add_handler(CommandHandler("health", health_cmd))
+    app_.add_handler(CommandHandler("seedstandups", seedstandups_cmd))
+    app_.add_handler(CommandHandler("previewstandups", previewstandups_cmd))
+    app_.add_handler(CommandHandler("standuphelp", standuphelp_cmd))
+    app_.add_handler(CommandHandler("recoverstandups", recoverstandups_cmd))
 
     # Silent auto-registration & admin DM on add/remove
     app_.add_handler(ChatMemberHandler(on_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
