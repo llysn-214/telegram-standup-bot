@@ -301,7 +301,7 @@ What's preventing campaigns from moving?""",
     {
         "title": "🤝 Affiliates & Agents",
         "topic_names": ["Aff&Agents", "Affiliates & Agents"],
-        "tags": "@raz_marketing @brian_ph_aff @nina_ph_aff @ty_aff",
+        "tags": "@raz_marketing @brian_ph_aff @nina_ph_aff @trei_ph_aff",
         "body": """🗓 Priorities
 Which affiliates, agents, or recruitment efforts are your focus this week?
 
@@ -349,7 +349,7 @@ What's preventing content from going live?""",
     {
         "title": "💬 Community",
         "topic_names": ["Community"],
-        "tags": "@Cymon_PH_CommunityTL @raz_marketing @brian_ph_aff",
+        "tags": "@Cymon_PH_CommunityTL @raz_marketing @brian_ph_aff @raven_ph_community @ty_aff",
         "body": """🗓 Priorities
 Which community initiatives, events, or engagement activities are you driving this week?
 
