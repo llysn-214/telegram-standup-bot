@@ -350,6 +350,8 @@ What's preventing content from going live?""",
         "title": "💬 Community",
         "topic_names": ["Community"],
         "tags": "@Cymon_PH_CommunityTL @raz_marketing @brian_ph_aff @raven_ph_community @ty_aff",
+        # Observers are NOT tagged or reminded. Onboarding: move a handle into "tags" when ready.
+        "observers": "@jem_ph_community @rey_ph_community",
         "body": """🗓 Priorities
 Which community initiatives, events, or engagement activities are you driving this week?
 
@@ -365,7 +367,7 @@ What's impacting community growth or engagement?""",
     {
         "title": "🎨 Creatives",
         "topic_names": ["Creatives"],
-        "tags": "@santi_ph_creatives @jom_ph_creatives",
+        "tags": "@santi_ph_creatives @jom_ph_creatives @Lamine_vn_creatives",
         "body": """🗓 Priorities
 Which creative requests are your priority this week?
 
@@ -1180,6 +1182,9 @@ async def previewstandups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     for vertical in STANDUP_VERTICALS:
         topic_id = _resolve_vertical_topic_id(vertical, lookup)
         label = f"{vertical['title']} (topic {topic_id if topic_id is not None else 'missing'})"
+        if vertical.get("observers"):
+            # Strip "@" so the preview doesn't look like a tag
+            label += "\nObserving (not tagged): " + vertical["observers"].replace("@", "")
         messages.append(label + "\n\n" + render_scheduled_message(_standup_topic_message(vertical)))
 
     preview = "\n\n====================\n\n".join(messages)
